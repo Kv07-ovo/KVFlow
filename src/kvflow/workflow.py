@@ -1,20 +1,22 @@
 """The workflow runner: one requirement in, durable evidence out.
 
-This is the single place where a workflow actually happens. The CLI, the MCP
-server and the DSH plugin all call :func:`run_requirement`, so they cannot drift
-into three different orchestrators: they read and write the same durable store.
+This is the single place where a workflow happens. The CLI, the MCP server, the
+background runner process and the DSH plugin all call into it, so they cannot
+drift into four different orchestrators: they read and write the same durable
+store.
 
-Sequence for one run:
+The work is split so a long run can outlive the caller:
 
-1. resolve the approved project configuration, template, model and budget profile;
-2. create the durable job and compile the plan (manager plan when the template
-   asks for it and the adapter is reachable, otherwise the template's own DAG);
-3. register the global -> project -> job budget chain with a hard micro-CNY cap;
-4. run the dependency waves, at most ``max_parallel_workers`` nodes at a time,
-   each in its own owned workspace with its own capability ticket;
-5. collect the executor receipts the workers produced, ask the manager to review
-   that evidence, and integrate only what the review approved;
-6. write project-scoped knowledge with provenance, and return a receipt.
+``prepare_run``   resolve the approved project, template, model and budget
+                  profile; create the durable job; compile and validate the plan;
+                  register the budget chain; write the run manifest. It returns
+                  the job identity without running anything.
+``execute_run``   drive the persisted job: dependency waves with real concurrency,
+                  one owned workspace and one capability ticket per node, the
+                  executor receipts the workers wrote, the manager review gate,
+                  integration of approved bytes, and project knowledge. It can be
+                  called by any process, at any time, for a job that exists.
+``run_requirement`` is the convenience path: prepare, then execute in this process.
 
 Nothing is replayed: a node that failed is reported as failed, its attempt is
 consumed durably, and an unknown outcome stays unknown.
@@ -26,7 +28,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -38,17 +40,57 @@ from .core.knowledge import KnowledgeQuery, KnowledgeService
 from .core.mcp_server import TOOL_SPECS
 from .core.scheduler import Scheduler
 from .core.security import CapabilityAuthority
-from .core.store import Store, new_id, utcnow
+from .core.store import Store, utcnow
 from .core.tools import ToolService
 from .core.worker import WorkerLoop
 from .core.workspace import WorkspaceManager, source_digest
 
 GLOBAL_SCOPE = "kvflow-global"
-#: every run is bounded twice: by the profile's money/time caps and by this
+#: every run is bounded twice: by the profile's caps and by this wall-clock ceiling
 MAX_RUN_SECONDS = 3_600.0
+RUNS_DIR = "runs"
 
 
-def _scopes(ledger: BudgetLedger, config: registry.ProjectConfig, store: Store,
+# --------------------------------------------------------------- run manifest
+
+
+def runs_dir(home: str | Path) -> Path:
+    path = Path(home).expanduser() / RUNS_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def run_manifest(home: str | Path, job_id: str) -> dict:
+    path = runs_dir(home) / f"{job_id}.json"
+    if not path.is_file():
+        raise NotFoundError("unknown workflow run", job_id=job_id)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_manifest(home: str | Path, job_id: str, payload: dict) -> None:
+    path = runs_dir(home) / f"{job_id}.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
+                         encoding="utf-8")
+    temporary.replace(path)
+
+
+def update_manifest(home: str | Path, job_id: str, **fields: Any) -> dict:
+    """Merge fields into one run manifest; this is how a pid or receipt is recorded."""
+    manifest = run_manifest(home, job_id)
+    manifest.update(fields)
+    _write_manifest(home, job_id, manifest)
+    return manifest
+
+
+# ------------------------------------------------------------------- scopes
+
+
+def config_digest(config: registry.ProjectConfig) -> str:
+    return registry.authorization_digest(config)
+
+
+def _scopes(ledger: BudgetLedger, config: registry.ProjectConfig,
             job_id: str, *, home: str | Path) -> dict[str, str]:
     """Register (idempotently) the global -> project -> job budget chain."""
     budgets = registry.load_budgets(home)
@@ -112,8 +154,165 @@ def _scopes(ledger: BudgetLedger, config: registry.ProjectConfig, store: Store,
     return {"global": GLOBAL_SCOPE, "project": project_scope, "job": job_scope}
 
 
-def config_digest(config: registry.ProjectConfig) -> str:
-    return registry.authorization_digest(config)
+# ------------------------------------------------------------------ resolve
+
+
+def _resolve(home: Path, project_id: str) -> tuple[registry.ProjectConfig, Project]:
+    index = registry.Registry(home)
+    entry = index.get(project_id)
+    config = registry.read_config(entry["canonical_root"])
+    if not config.approved_by_user:
+        raise AuthorizationError(
+            "the project configuration has not been approved by the user",
+            project_id=project_id,
+            next=f"kvflow project onboard --path {config.canonical_root} --write",
+        )
+    project, _profiles = registry.compile_project(config, home=home)
+    return config, project
+
+
+def _store_for(home: Path) -> Store:
+    store = Store(home / "agent_os.sqlite3")
+    store.initialize()
+    return store
+
+
+def _plan_source_report(
+    *, template: templates.WorkflowTemplate, config: registry.ProjectConfig,
+    compiled: dict, job_id: str, home: Path, profile: model_profiles.ModelProfile,
+    manager: Any | None, manager_error: str | None,
+) -> tuple[Any, str, dict | None, str | None]:
+    if template.plan != "manager":
+        return planner.deterministic_from(compiled["plan"]), "deterministic_template", None, None
+    if manager is None:
+        return (planner.deterministic_from(compiled["plan"]), "deterministic_template", None,
+                manager_error or "no manager is available for this profile")
+    try:
+        manager_plan = manager.build_plan(
+            job_id=job_id, project=_PROJECT_HOLDER["project"],
+            objective=_PLANNING["requirement"], allowed_roots=list(config.allowed_write_roots),
+            resource_budget=compiled["plan"]["resource_budget"],
+            authorization_digest=_PROJECT_HOLDER["project"].authorization_digest,
+        )
+        validated = planner.validate_manager_plan(
+            json.loads(manager_plan.model_dump_json()), template=template, config=config
+        )
+        return validated, "live_manager", manager_plan.model_dump(mode="json"), None
+    except V1Error as exc:
+        return (planner.deterministic_from(compiled["plan"]), "deterministic_template", None,
+                f"{type(exc).__name__}: {exc}")
+
+
+# small explicit holders keep the planner call signature readable without a
+# twelve-argument function
+_PROJECT_HOLDER: dict[str, Any] = {}
+_PLANNING: dict[str, Any] = {}
+
+
+# ------------------------------------------------------------------ prepare
+
+
+def prepare_run(
+    *,
+    requirement: str,
+    project_id: str,
+    home: str | Path,
+    template_id: str | None = None,
+    max_nodes: int | None = None,
+    manager_factory: Any | None = None,
+    manager_profile_override: str | None = None,
+) -> dict[str, Any]:
+    """Create the durable job, plan and budget chain for one requirement."""
+    from .core import cli as core_cli
+
+    text = (requirement or "").strip()
+    if not text:
+        raise ContractError("a requirement is required")
+    paths = core_cli.runtime_paths(str(home))
+    home_path = paths["home"]
+    config, project = _resolve(home_path, project_id)
+    template = templates.get(template_id or config.template, home=home_path)
+    profile_id = manager_profile_override or config.model_profile
+    profile = model_profiles.load(profile_id, home=home_path)
+    store = _store_for(home_path)
+
+    drift: str | None = None
+    try:
+        stored = store.project(project.id)
+        if stored.authorization_digest != project.authorization_digest:
+            drift = (
+                "the project configuration differs from the registered authorization;"
+                " this run uses the registered one"
+            )
+        project = stored
+    except NotFoundError:
+        store.register_project(project)
+
+    job_id = store.create_job(project.id, f"[{template.id}] {text}",
+                              project.authorization_digest)
+    compiled = planner.compile_plan(requirement=text, template=template, config=config,
+                                    job_id=job_id, home=home_path)
+    _PROJECT_HOLDER["project"] = project
+    _PLANNING["requirement"] = text
+
+    manager = None
+    manager_error: str | None = None
+    if manager_factory is not None:
+        manager = manager_factory()
+    elif template.plan == "manager":
+        try:
+            manager, _identity = agents.build_manager(
+                profile, home=home_path, cwd=config.canonical_root
+            )
+        except V1Error as exc:
+            manager_error = f"{type(exc).__name__}: {exc}"
+    plan, plan_source, manager_plan_document, refusal = _plan_source_report(
+        template=template, config=config, compiled=compiled, job_id=job_id, home=home_path,
+        profile=profile, manager=manager, manager_error=manager_error,
+    )
+    if max_nodes is not None and len(plan.nodes) > int(max_nodes):
+        plan = planner.deterministic_from(compiled["plan"])
+        plan_source = f"{plan_source}+trimmed"
+    store.set_plan(plan, expected_job_revision=1)
+    store.transition_job(job_id, "NEW", "PLANNING", actor="manager")
+    store.transition_job(job_id, "PLANNING", "ASSIGNED", actor="manager")
+    ledger = BudgetLedger(store)
+    scope_ids = _scopes(ledger, config, job_id, home=home_path)
+
+    manifest = {
+        "job_id": job_id,
+        "project_id": project.id,
+        "display_name": config.display_name,
+        "requirement": text,
+        "template": template.id,
+        "model_profile": profile.id,
+        "budget_profile": config.budget_profile,
+        "authorization_digest": project.authorization_digest,
+        "plan_id": plan.id,
+        "plan_digest": content_digest(plan),
+        "plan_source": plan_source,
+        "acceptance": list(plan.acceptance),
+        "nodes": [node.id for node in plan.nodes],
+        "waves": planner.parallel_groups(plan),
+        "max_parallel_workers": template.max_parallel_workers,
+        "scopes": scope_ids,
+        "manager_plan": manager_plan_document,
+        # planning is reported as its own fact: which planner produced the DAG, and
+        # why a manager plan was not used. It is visible in every entrance without
+        # being confused with the run's own outcome.
+        "planning": {
+            "source": plan_source,
+            "manager_plan_used": manager_plan_document is not None,
+            "fallback_reason": refusal,
+        },
+        "problems": [item for item in (drift,) if item],
+        "created_at": utcnow().isoformat(),
+    }
+    _write_manifest(home_path, job_id, manifest)
+    return manifest
+
+
+# ------------------------------------------------------------------ execute
 
 
 def _tool_specs_for(actions: Sequence[str]) -> list[dict[str, Any]]:
@@ -127,65 +326,12 @@ def _tool_specs_for(actions: Sequence[str]) -> list[dict[str, Any]]:
     ]
 
 
-def _planning(
-    *, requirement: str, template: templates.WorkflowTemplate, config: registry.ProjectConfig,
-    project: Project, compiled: dict, job_id: str, home: Path, profile: model_profiles.ModelProfile,
-    manager: Any | None, manager_error: str | None,
-) -> tuple[Any, str, dict[str, Any] | None, str | None]:
-    """Decide the plan: the manager's, or the template's own DAG."""
-    if template.plan != "manager":
-        return planner.deterministic_from(compiled["plan"]), "deterministic_template", None, None
-    if manager is None:
-        return (
-            planner.deterministic_from(compiled["plan"]),
-            "deterministic_template",
-            None,
-            manager_error or "no manager is available for this profile",
-        )
-    try:
-        manager_plan = manager.build_plan(
-            job_id=job_id,
-            project=project,
-            objective=requirement,
-            allowed_roots=list(config.allowed_write_roots),
-            resource_budget=compiled["plan"]["resource_budget"],
-            authorization_digest=project.authorization_digest,
-        )
-        validated = planner.validate_manager_plan(
-            json.loads(manager_plan.model_dump_json()), template=template, config=config
-        )
-        return validated, "live_manager", manager_plan.model_dump(mode="json"), None
-    except V1Error as exc:
-        return (
-            planner.deterministic_from(compiled["plan"]),
-            "deterministic_template",
-            None,
-            f"{type(exc).__name__}: {exc}",
-        )
-
-
 def _run_wave(
-    *,
-    node_ids: Sequence[str],
-    plan: Any,
-    project: Project,
-    config: registry.ProjectConfig,
-    store: Store,
-    scheduler: Scheduler,
-    authority: CapabilityAuthority,
-    tools: ToolService,
-    ledger: BudgetLedger,
-    scope_id: str,
-    manager_ws: WorkspaceManager,
-    snapshot: Any,
-    handles: dict[str, Any],
-    dependencies: Mapping[str, Sequence[str]],
-    provider: Any,
-    profile: model_profiles.ModelProfile,
-    max_steps: int,
-    max_completion_tokens: int,
-    max_parallel: int,
-    lock: threading.Lock,
+    *, node_ids: Sequence[str], plan: Any, project: Project,
+    store: Store, scheduler: Scheduler, authority: CapabilityAuthority, tools: ToolService,
+    ledger: BudgetLedger, scope_id: str, manager_ws: WorkspaceManager, snapshot: Any,
+    handles: dict[str, Any], dependencies: Mapping[str, Sequence[str]], provider: Any,
+    max_steps: int, max_completion_tokens: int, max_parallel: int, lock: threading.Lock,
     results: dict[str, dict[str, Any]],
 ) -> None:
     """Run one dependency wave: every node runs, at most ``max_parallel`` at once."""
@@ -194,12 +340,10 @@ def _run_wave(
 
     def work(node_id: str) -> None:
         node = node_by_id[node_id]
-        started_monotonic = time.monotonic()
+        started = time.monotonic()
         report: dict[str, Any] = {
-            "node_id": node_id,
-            "status": "EXECUTOR_ERROR",
-            "started_at": utcnow().isoformat(),
-            "started_monotonic": started_monotonic,
+            "node_id": node_id, "status": "EXECUTOR_ERROR",
+            "started_at": utcnow().isoformat(), "started_monotonic": started,
         }
         try:
             base = None
@@ -221,8 +365,8 @@ def _run_wave(
             claim = scheduler.claim(job_id, node_id)
             actions = [action.value for action in node.allowed_tools]
             ticket, _ = authority.issue(
-                project_id=project.id, job_id=job_id, node_id=node_id,
-                run_id=claim.run_id, lease_id=claim.lease_id, role="worker", actions=actions,
+                project_id=project.id, job_id=job_id, node_id=node_id, run_id=claim.run_id,
+                lease_id=claim.lease_id, role="worker", actions=actions,
             )
             loop = WorkerLoop(
                 provider=provider, tools=tools, ledger=ledger, ticket=ticket,
@@ -232,8 +376,7 @@ def _run_wave(
                 },
                 scope_id=scope_id,
                 discovered_tools=_tool_specs_for(actions),
-                max_steps=max_steps,
-                max_completion_tokens=max_completion_tokens,
+                max_steps=max_steps, max_completion_tokens=max_completion_tokens,
                 max_seconds=900.0,
             )
             outcome = loop.run(node.objective)
@@ -244,13 +387,10 @@ def _run_wave(
                                retryable=outcome.status != "BLOCKED")
             report.update(
                 {
-                    "status": outcome.status,
-                    "summary": outcome.summary[:600],
-                    "steps": outcome.steps,
-                    "tool_calls": outcome.tool_calls,
+                    "status": outcome.status, "summary": outcome.summary[:600],
+                    "steps": outcome.steps, "tool_calls": outcome.tool_calls,
                     "live_calls": outcome.live_calls,
-                    "receipt_ids": list(outcome.receipt_ids),
-                    "usage": dict(outcome.usage),
+                    "receipt_ids": list(outcome.receipt_ids), "usage": dict(outcome.usage),
                     "notes": list(outcome.notes)[:12],
                 }
             )
@@ -262,7 +402,7 @@ def _run_wave(
         finally:
             report["finished_at"] = utcnow().isoformat()
             report["finished_monotonic"] = time.monotonic()
-            report["seconds"] = round(report["finished_monotonic"] - started_monotonic, 2)
+            report["seconds"] = round(report["finished_monotonic"] - started, 2)
             with lock:
                 results[node_id] = report
 
@@ -270,60 +410,78 @@ def _run_wave(
         list(pool.map(work, list(node_ids)))
 
 
-def run_requirement(
+def _source_intact(config: registry.ProjectConfig, snapshot: Any) -> bool:
+    """The registered source tree still hashes to what the snapshot captured."""
+    for entry in getattr(snapshot, "entries", ()):
+        source = Path(config.canonical_root) / entry.relative_path
+        if not source.is_file():
+            return False
+        digest, _size = source_digest(source)
+        if digest != entry.sha256:
+            return False
+    return True
+
+
+def execute_run(
     *,
-    requirement: str,
-    project_id: str,
+    job_id: str,
     home: str | Path,
-    template_id: str | None = None,
     max_steps: int = 10,
     max_completion_tokens: int = 1024,
-    max_nodes: int | None = None,
-    dry_run: bool = False,
     provider_factory: Any | None = None,
     manager_factory: Any | None = None,
-    integrate: bool = False,
 ) -> dict[str, Any]:
-    """Start and drive one workflow. ``provider_factory``/``manager_factory`` are
-    test seams: the product path builds the real adapters from the model profile."""
+    """Drive one persisted run to its review and integration."""
     from .core import cli as core_cli
 
-    text = (requirement or "").strip()
-    if not text:
-        raise ContractError("a requirement is required")
     paths = core_cli.runtime_paths(str(home))
     home_path = paths["home"]
-    index = registry.Registry(home_path)
-    entry = index.get(project_id)
-    config = registry.read_config(entry["canonical_root"])
-    if not config.approved_by_user:
-        raise AuthorizationError(
-            "the project configuration has not been approved by the user",
-            project_id=project_id,
-            next=f"kvflow project onboard --path {config.canonical_root} --write",
-        )
-    template = templates.get(template_id or config.template, home=home_path)
-    profile = model_profiles.load(config.model_profile, home=home_path)
-    project, _profiles = registry.compile_project(config, home=home_path)
-    store = Store(paths["database"])
-    store.initialize()
-    drift: str | None = None
+    manifest = run_manifest(home_path, job_id)
+    project_id = manifest["project_id"]
+    config, project = _resolve(home_path, project_id)
+    template = templates.get(manifest["template"], home=home_path)
+    profile = model_profiles.load(manifest["model_profile"], home=home_path)
+    store = _store_for(home_path)
     try:
-        stored = store.project(project.id)
+        project = store.project(project.id)
     except NotFoundError:
         store.register_project(project)
-        stored = project
-    if stored.authorization_digest != project.authorization_digest:
-        # the durable registration is the authorization of record: a configuration
-        # change never silently widens or narrows what this run may do
-        drift = (
-            "the project configuration differs from the registered authorization;"
-            " this run uses the registered one"
-        )
-    project = stored
+    plan = store.current_plan(job_id)
+    run: dict[str, Any] = {
+        "kind": "KVFLOW_WORKFLOW",
+        "product": "KVFlow",
+        "job_id": job_id,
+        "project_id": project_id,
+        "display_name": manifest["display_name"],
+        "requirement": manifest["requirement"],
+        "template": template.id,
+        "model_profile": profile.id,
+        "plan_id": plan.id,
+        "plan_source": manifest["plan_source"],
+        "plan_digest": manifest["plan_digest"],
+        "acceptance": list(plan.acceptance),
+        "nodes": [node.id for node in plan.nodes],
+        "waves": planner.parallel_groups(plan),
+        "authorization_digest": project.authorization_digest,
+        "manager_plan": manifest.get("manager_plan"),
+        "planning": manifest.get("planning") or {"source": manifest["plan_source"]},
+        "started_at": utcnow().isoformat(),
+        "problems": list(manifest.get("problems", [])),
+    }
+
+    manager = None
+    manager_error: str | None = None
+    if manager_factory is not None:
+        manager = manager_factory()
+    elif template.review == "manager":
+        try:
+            manager, _identity = agents.build_manager(
+                profile, home=home_path, cwd=config.canonical_root
+            )
+        except V1Error as exc:
+            manager_error = f"{type(exc).__name__}: {exc}"
+
     manager_ws = WorkspaceManager(project)
-    # one snapshot scope list, deduplicated: a read root of "." already covers the
-    # write roots, and overlapping scopes would copy the same file twice
     if "." in config.allowed_read_roots:
         snapshot_scopes = ["."]
     else:
@@ -333,116 +491,38 @@ def run_requirement(
                 snapshot_scopes.append(scope)
     snapshot = manager_ws.create_snapshot(include_scopes=snapshot_scopes or ["."],
                                           notes=f"kvflow {template.id}")
-
-    run: dict[str, Any] = {
-        "kind": "KVFLOW_WORKFLOW",
-        "product": "KVFlow",
-        "project_id": project_id,
-        "display_name": config.display_name,
-        "requirement": text,
-        "template": template.id,
-        "model_profile": profile.id,
-        "started_at": utcnow().isoformat(),
-        "snapshot_id": snapshot.snapshot_id,
-        "authorization_digest": project.authorization_digest,
-        "problems": [],
-    }
-    if drift:
-        run["problems"].append(drift)
-
-    dry_run_report = {
-        **run,
-        "dry_run": True,
-        "executed": False,
-        "resolved_roles": agents.diagnose(profile, home=home_path),
-        "budget_profile": registry.budget_profile(home_path, config.budget_profile),
-        "note": "no job was created and no model was called",
-    }
-    if dry_run:
-        compiled = planner.compile_plan(
-            requirement=text, template=template, config=config, job_id="dry-run",
-            home=home_path,
-        )
-        return {**dry_run_report, "plan": compiled["plan"], "plan_source": "dry_run_preview"}
-
-    job_id = store.create_job(project.id, f"[{template.id}] {text}",
-                              project.authorization_digest)
-    compiled = planner.compile_plan(
-        requirement=text, template=template, config=config, job_id=job_id, home=home_path,
-    )
-    manager = None
-    manager_error: str | None = None
-    if manager_factory is not None:
-        manager = manager_factory()
-    elif not dry_run:
-        try:
-            manager, _identity = agents.build_manager(
-                profile, home=home_path, cwd=config.canonical_root
-            )
-        except V1Error as exc:
-            manager_error = f"{type(exc).__name__}: {exc}"
-    plan, plan_source, manager_plan_document, refusal = _planning(
-        requirement=text, template=template, config=config, project=project,
-        compiled=compiled, job_id=job_id, home=home_path, profile=profile,
-        manager=manager if template.plan == "manager" else None,
-        manager_error=manager_error,
-    )
-    if refusal:
-        run["problems"].append(f"manager planning fell back: {refusal}")
-    if max_nodes is not None and len(plan.nodes) > int(max_nodes):
-        plan = planner.deterministic_from(
-            planner.compile_plan(
-                requirement=text, template=template, config=config, job_id=job_id,
-                home=home_path,
-            )["plan"]
-        )
-        plan_source = f"{plan_source}+trimmed"
-
-    store.set_plan(plan, expected_job_revision=1)
-    store.transition_job(job_id, "NEW", "PLANNING", actor="manager")
-    store.transition_job(job_id, "PLANNING", "ASSIGNED", actor="manager")
-    run.update(
-        {
-            "job_id": job_id,
-            "plan_id": plan.id,
-            "plan_source": plan_source,
-            "plan_digest": content_digest(plan),
-            "acceptance": list(plan.acceptance),
-            "nodes": [node.id for node in plan.nodes],
-            "waves": planner.parallel_groups(plan),
-            "manager_plan": manager_plan_document,
-        }
-    )
+    run["snapshot_id"] = snapshot.snapshot_id
 
     ledger = BudgetLedger(store)
-    scope_ids = _scopes(ledger, config, store, job_id, home=home_path)
-    scheduler = Scheduler(store, worker_slots=min(3, template.max_parallel_workers,
-                                                  int(registry.budget_profile(
-                                                      home_path, config.budget_profile
-                                                  )["concurrency"])))
+    scope_ids = manifest.get("scopes") or _scopes(ledger, config, job_id, home=home_path)
+    scheduler = Scheduler(
+        store,
+        worker_slots=max(1, min(3, template.max_parallel_workers,
+                                int(registry.budget_profile(
+                                    home_path, config.budget_profile)["concurrency"]))),
+    )
     authority = CapabilityAuthority(store)
     tools = ToolService(store, authority, workspace_root=manager_ws.managed_root)
-    provider = provider_factory() if provider_factory is not None else agents.build_worker_provider(profile)
+    provider = (provider_factory() if provider_factory is not None
+                else agents.build_worker_provider(profile))
 
     handles: dict[str, Any] = {}
     results: dict[str, dict[str, Any]] = {}
     lock = threading.Lock()
     dependencies = {node.id: tuple(node.dependencies) for node in plan.nodes}
     for wave in planner.parallel_groups(plan):
-        if len(wave) > template.max_parallel_workers:
-            wave = sorted(wave)[: template.max_parallel_workers]
         _run_wave(
-            node_ids=wave, plan=plan, project=project, config=config, store=store,
-            scheduler=scheduler, authority=authority, tools=tools, ledger=ledger,
-            scope_id=scope_ids["job"], manager_ws=manager_ws, snapshot=snapshot,
-            handles=handles, dependencies=dependencies, provider=provider, profile=profile,
-            max_steps=max_steps, max_completion_tokens=max_completion_tokens,
-            max_parallel=template.max_parallel_workers,
-            lock=lock, results=results,
+            node_ids=wave, plan=plan, project=project, store=store, scheduler=scheduler,
+            authority=authority, tools=tools, ledger=ledger, scope_id=scope_ids["job"],
+            manager_ws=manager_ws, snapshot=snapshot, handles=handles,
+            dependencies=dependencies, provider=provider, max_steps=max_steps,
+            max_completion_tokens=max_completion_tokens,
+            max_parallel=template.max_parallel_workers, lock=lock, results=results,
         )
 
     run["node_reports"] = {key: results[key] for key in sorted(results)}
-    run["node_states"] = {key: value.value for key, value in scheduler.node_states(job_id).items()}
+    run["node_states_final"] = {key: value.value
+                                for key, value in scheduler.node_states(job_id).items()}
     run["worker_totals"] = {
         "live_calls": sum(report.get("live_calls", 0) for report in results.values()),
         "tool_calls": sum(report.get("tool_calls", 0) for report in results.values()),
@@ -453,20 +533,19 @@ def run_requirement(
         },
     }
     latest_handle = handles.get(plan.nodes[-1].id) or next(iter(handles.values()), None)
-    diff = manager_ws.workspace_diff(latest_handle) if latest_handle else {"changed": [],
-                                                                          "content_digest": ""}
+    diff = manager_ws.workspace_diff(latest_handle) if latest_handle else {
+        "changed": [], "content_digest": ""
+    }
     for change in diff.get("changed", []):
         change.pop("base_sha256", None)
         path = (latest_handle.root / change["relative_path"]) if latest_handle else None
         if path is not None and path.is_file() and path.stat().st_size <= 200_000:
-            text_body = path.read_text(encoding="utf-8", errors="replace")
-            change["content_preview"] = text_body[:6000]
-            change["content_bytes"] = len(text_body.encode("utf-8"))
+            body = path.read_text(encoding="utf-8", errors="replace")
+            change["content_preview"] = body[:6000]
+            change["content_bytes"] = len(body.encode("utf-8"))
     receipts = store.receipts(job_id)
-    run["diff"] = {
-        "changed": [change["relative_path"] for change in diff.get("changed", [])],
-        "content_digest": diff.get("content_digest"),
-    }
+    run["diff"] = {"changed": [change["relative_path"] for change in diff.get("changed", [])],
+                   "content_digest": diff.get("content_digest")}
     run["test_receipts"] = [
         {"receipt_id": row["receipt_id"], "profile_id": row["profile_id"],
          "exit_code": row["exit_code"]}
@@ -479,11 +558,8 @@ def run_requirement(
     if template.review == "manager" and manager is not None:
         try:
             verdict = manager.review(
-                objective=plan.objective,
-                acceptance=list(plan.acceptance),
-                diff=diff,
-                receipts=receipts,
-                content_digest=diff.get("content_digest") or "",
+                objective=plan.objective, acceptance=list(plan.acceptance), diff=diff,
+                receipts=receipts, content_digest=diff.get("content_digest") or "",
             )
             run["review"] = verdict.to_dict()
         except V1Error as exc:
@@ -498,16 +574,22 @@ def run_requirement(
 
     run["integration"] = {"applied": [], "skipped": True,
                           "reason": "the manager did not approve the change"}
-    approved = bool(verdict is not None and verdict.verdict == "APPROVE")
-    if approved:
+    if verdict is not None and verdict.verdict == "APPROVE":
         try:
             integration_root = manager_ws.create_integration_tree(
                 job_id=job_id, snapshot_id=snapshot.snapshot_id
             )
             applied_paths: list[str] = []
             final_digest = ""
-            for node in plan.nodes:
-                node_handle = handles.get(node.id)
+            # Each leaf node's workspace already chains the bytes of its
+            # dependencies, so integrating the leaves carries the whole result.
+            # Applying an intermediate node as well would ask the integration tree
+            # to accept bytes it already holds from the leaf, which is a conflict by
+            # construction rather than a real disagreement between branches.
+            dependents = {dependency for node in plan.nodes for dependency in node.dependencies}
+            leaves = [node.id for node in plan.nodes if node.id not in dependents]
+            for node_id in leaves:
+                node_handle = handles.get(node_id)
                 if node_handle is None:
                     continue
                 outcome_for_node = manager_ws.apply_to_integration(
@@ -516,15 +598,11 @@ def run_requirement(
                 applied_paths.extend(outcome_for_node.get("applied", []))
                 final_digest = outcome_for_node.get("content_digest", final_digest)
             run["integration"] = {
-                "applied": applied_paths,
-                "content_digest": final_digest,
-                "integration_root": str(integration_root),
-                "skipped": False,
+                "applied": applied_paths, "content_digest": final_digest,
+                "integration_root": str(integration_root), "skipped": False,
                 "source_project_untouched": True,
-                "note": (
-                    "approved bytes were copied into this job's integration tree; the"
-                    " registered source project was not written"
-                ),
+                "note": ("approved bytes were copied into this job's integration tree;"
+                         " the registered source project was not written"),
             }
         except V1Error as exc:
             run["integration"] = {"applied": [], "skipped": True,
@@ -532,50 +610,95 @@ def run_requirement(
             run["problems"].append(f"integration refused: {type(exc).__name__}")
 
     _record_knowledge(store, project_id=project_id, job_id=job_id, run=run, receipts=receipts)
-
-    run["budget"] = {
-        "scopes": scope_ids,
-        "job_usage": ledger.usage(scope_ids["job"]),
-    }
+    run["budget"] = {"scopes": scope_ids, "job_usage": ledger.usage(scope_ids["job"])}
     run["source_not_modified"] = _source_intact(config, snapshot)
     if not run["source_not_modified"]:
         run["problems"].append("a registered source file changed during the run")
     run["resolved_roles"] = agents.diagnose(profile, home=home_path)
-    run["node_states_final"] = {
-        key: value.value for key, value in scheduler.node_states(job_id).items()
-    }
-    completed = [
-        key for key, value in run["node_states_final"].items()
-        if value in {"WORKER_COMPLETE", "MANAGER_APPROVED", "INTEGRATED", "APPLIED", "DONE"}
-    ]
+    completed = [key for key, value in run["node_states_final"].items()
+                 if value in {"WORKER_COMPLETE", "MANAGER_APPROVED", "INTEGRATED",
+                              "APPLIED", "DONE"}]
+    # PASS means the whole loop finished: every node complete, the manager's review
+    # accepted the evidence (when the template has one), and approved bytes really
+    # reached the integration tree. A FIX verdict is a real, reported outcome -- not
+    # a pass with a note.
+    review_ok = str((run.get("review") or {}).get("verdict")) in {"APPROVE", "NOT_REQUIRED"}
+    integration_ok = bool(run.get("integration", {}).get("skipped") is False)
+    if not review_ok:
+        run["problems"].append(
+            f"the manager verdict was {(run.get('review') or {}).get('verdict')}"
+        )
+    if not integration_ok:
+        run["problems"].append("nothing was integrated")
     run["status"] = (
-        "PASS" if not run["problems"] and len(completed) == len(plan.nodes) else "PARTIAL"
+        "PASS"
+        if not run["problems"] and len(completed) == len(plan.nodes)
+        and review_ok and integration_ok
+        else "PARTIAL"
     )
     run["ended_at"] = utcnow().isoformat()
+    _write_manifest(home_path, job_id, {**manifest, "last_receipt": {
+        key: run[key] for key in
+        ("status", "problems", "review", "test_receipts", "integration", "ended_at",
+         "node_states_final", "node_reports", "worker_totals", "budget", "diff",
+         "source_not_modified", "resolved_roles", "plan_source", "planning", "template",
+         "requirement", "acceptance", "nodes", "job_id", "project_id")
+        if key in run
+    }})
     return run
 
 
-def _source_intact(config: registry.ProjectConfig, snapshot: Any) -> bool:
-    """The registered source tree still hashes to what the snapshot captured.
+def run_requirement(
+    *,
+    requirement: str,
+    project_id: str,
+    home: str | Path,
+    template_id: str | None = None,
+    max_steps: int = 10,
+    max_completion_tokens: int = 1024,
+    max_nodes: int | None = None,
+    dry_run: bool = False,
+    provider_factory: Any | None = None,
+    manager_factory: Any | None = None,
+) -> dict[str, Any]:
+    """Prepare and execute one workflow in this process."""
+    from .core import cli as core_cli
 
-    The comparison uses the core's own canonical source digest, so it agrees with
-    the snapshot by construction instead of re-inventing newline handling here.
-    """
-    for entry in getattr(snapshot, "entries", ()):
-        source = Path(config.canonical_root) / entry.relative_path
-        if not source.is_file():
-            return False
-        digest, _size = source_digest(source)
-        if digest != entry.sha256:
-            return False
-    return True
+    if dry_run:
+        paths = core_cli.runtime_paths(str(home))
+        home_path = paths["home"]
+        config, _project = _resolve(home_path, project_id)
+        template = templates.get(template_id or config.template, home=home_path)
+        profile = model_profiles.load(config.model_profile, home=home_path)
+        compiled = planner.compile_plan(requirement=requirement, template=template,
+                                        config=config, job_id="dry-run", home=home_path)
+        return {
+            "kind": "KVFLOW_WORKFLOW", "product": "KVFlow", "dry_run": True,
+            "executed": False, "project_id": project_id, "requirement": requirement,
+            "template": template.id, "model_profile": profile.id,
+            "plan": compiled["plan"], "plan_source": "dry_run_preview",
+            "resolved_roles": agents.diagnose(profile, home=home_path),
+            "budget_profile": registry.budget_profile(home_path, config.budget_profile),
+            "note": "no job was created and no model was called",
+        }
+    manifest = prepare_run(requirement=requirement, project_id=project_id, home=home,
+                           template_id=template_id, max_nodes=max_nodes,
+                           manager_factory=manager_factory)
+    return execute_run(job_id=manifest["job_id"], home=home, max_steps=max_steps,
+                       max_completion_tokens=max_completion_tokens,
+                       provider_factory=provider_factory, manager_factory=manager_factory)
+
+
+# ------------------------------------------------------- knowledge/status
 
 
 def _record_knowledge(store: Store, *, project_id: str, job_id: str, run: dict,
                       receipts: Sequence[Mapping[str, Any]]) -> None:
     """Project knowledge with provenance: a report, plus executor-verified facts."""
     service = KnowledgeService(store)
-    digest = config_digest_from_run(run)
+    digest = run.get("authorization_digest") or content_digest(
+        {"job": job_id, "plan": run.get("plan_digest")}
+    )
     summary = (
         f"KVFlow {run['template']} run for {run['requirement'][:200]} finished with"
         f" status {run.get('status')}; nodes {run.get('nodes')}; review"
@@ -584,9 +707,8 @@ def _record_knowledge(store: Store, *, project_id: str, job_id: str, run: dict,
     try:
         service.propose(
             project_id=project_id, topic=f"workflow-{job_id}", content=summary,
-            author="manager", kind="REPORTED_FACT",
-            source_ref=f"workflow:{job_id}", source_digest=content_digest(run),
-            authorization_digest=digest, job_id=job_id,
+            author="manager", kind="REPORTED_FACT", source_ref=f"workflow:{job_id}",
+            source_digest=content_digest(run), authorization_digest=digest, job_id=job_id,
         )
     except V1Error:
         return
@@ -595,7 +717,7 @@ def _record_knowledge(store: Store, *, project_id: str, job_id: str, run: dict,
             record = store.receipt(row["receipt_id"])
             service.record_executor_fact(
                 project_id=project_id, topic=f"executor-receipt-{row['receipt_id']}",
-                content=(f"profile {row['profile_id']} exited {row['exit_code']}"),
+                content=f"profile {row['profile_id']} exited {row['exit_code']}",
                 receipt_id=row["receipt_id"], receipt_digest=content_digest(record),
                 authorization_digest=digest, job_id=job_id,
             )
@@ -603,28 +725,26 @@ def _record_knowledge(store: Store, *, project_id: str, job_id: str, run: dict,
             continue
 
 
-def config_digest_from_run(run: Mapping[str, Any]) -> str:
-    digest = run.get("authorization_digest")
-    if isinstance(digest, str) and len(digest) == 64:
-        return digest
-    return content_digest({"job": run.get("job_id"), "plan": run.get("plan_digest")})
-
-
 def status(home: str | Path, job_id: str) -> dict[str, Any]:
     """Durable status of one workflow, readable from any entrance."""
-    from .core import cli as core_cli
-
-    paths = core_cli.runtime_paths(str(home))
-    store = Store(paths["database"])
-    store.initialize()
+    paths = _paths(home)
+    store = _store_for(paths["home"])
     job = store.job(job_id)
     scheduler = Scheduler(store)
+    manifest: dict[str, Any] = {}
+    try:
+        manifest = run_manifest(paths["home"], job_id)
+    except NotFoundError:
+        pass
     return {
         "job_id": job_id,
         "project_id": job["project_id"],
         "state": job["state"],
         "objective": job["objective"],
         "revision": job["revision"],
+        "template": manifest.get("template"),
+        "model_profile": manifest.get("model_profile"),
+        "plan_source": manifest.get("plan_source"),
         "nodes": {key: value.value for key, value in scheduler.node_states(job_id).items()},
         "receipts": [
             {"receipt_id": row["receipt_id"], "profile_id": row["profile_id"],
@@ -638,16 +758,14 @@ def status(home: str | Path, job_id: str) -> dict[str, Any]:
                 KnowledgeQuery(project_id=job["project_id"], limit=25)
             )
         ],
+        "last_receipt": manifest.get("last_receipt"),
         "checkpoint": store.checkpoint(),
     }
 
 
 def list_runs(home: str | Path, *, project_id: str | None = None, limit: int = 25) -> dict:
-    from .core import cli as core_cli
-
-    paths = core_cli.runtime_paths(str(home))
-    store = Store(paths["database"])
-    store.initialize()
+    paths = _paths(home)
+    store = _store_for(paths["home"])
     with store.read() as conn:
         if project_id:
             rows = conn.execute(
@@ -658,19 +776,25 @@ def list_runs(home: str | Path, *, project_id: str | None = None, limit: int = 2
         else:
             rows = conn.execute(
                 "SELECT job_id, project_id, state, objective, revision, updated_at"
-                " FROM jobs ORDER BY updated_at DESC LIMIT ?",
-                (int(limit),),
+                " FROM jobs ORDER BY updated_at DESC LIMIT ?", (int(limit),),
             ).fetchall()
-    return {"runs": [dict(row) for row in rows], "count": len(rows)}
+    runs = []
+    for row in rows:
+        item = dict(row)
+        try:
+            manifest = run_manifest(paths["home"], item["job_id"])
+            item["template"] = manifest.get("template")
+            item["plan_source"] = manifest.get("plan_source")
+        except NotFoundError:
+            item["template"] = None
+        runs.append(item)
+    return {"runs": runs, "count": len(runs)}
 
 
 def control(home: str | Path, job_id: str, action: str, *, reason: str = "") -> dict:
     """pause / resume / cancel, shared by the CLI, MCP and the plugin."""
-    from .core import cli as core_cli
-
-    paths = core_cli.runtime_paths(str(home))
-    store = Store(paths["database"])
-    store.initialize()
+    paths = _paths(home)
+    store = _store_for(paths["home"])
     scheduler = Scheduler(store)
     if action == "pause":
         revision = scheduler.pause(job_id, actor="user")
@@ -681,3 +805,9 @@ def control(home: str | Path, job_id: str, action: str, *, reason: str = "") -> 
     else:
         raise ContractError("unknown control action", action=action)
     return {"job_id": job_id, "state": store.job_state(job_id).value, "revision": revision}
+
+
+def _paths(home: str | Path) -> dict[str, Path]:
+    from .core import cli as core_cli
+
+    return core_cli.runtime_paths(str(home))
