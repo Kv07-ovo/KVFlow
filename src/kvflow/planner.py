@@ -30,7 +30,15 @@ MAX_PLAN_NODES = 8
 
 
 def _stage_nodes(template: WorkflowTemplate, config: ProjectConfig,
-                 requirement: str) -> list[NodeSpec]:
+                 requirement: str, job_id: str) -> list[NodeSpec]:
+    """One node per stage, with a lineage key scoped to *this task*.
+
+    ``lineage_key`` is what makes a retry budget impossible to reset inside a
+    task: attempts are counted durably per (project, lineage). Scoping it to the
+    job means "another attempt of this node in this task" is bounded at the core's
+    limit, while a genuinely new user request is a new task with its own budget --
+    a new request is not a retry of the previous one.
+    """
     known_profiles = {profile.id for profile in config.profiles}
     reader_profiles = [
         profile.id for profile in config.profiles
@@ -52,7 +60,7 @@ def _stage_nodes(template: WorkflowTemplate, config: ProjectConfig,
         nodes.append(
             NodeSpec(
                 id=stage.id,
-                lineage_key=f"lin-{stage.id}",
+                lineage_key=f"lin-{job_id}-{stage.id}",
                 objective=stage.objective.format(requirement=requirement.strip()),
                 write_scopes=list(config.allowed_write_roots) if stage.write else [],
                 test_profile=profile,
@@ -92,7 +100,7 @@ def compile_plan(
     text = (requirement or "").strip()
     if not text:
         raise ContractError("a requirement is required")
-    nodes = _stage_nodes(template, config, text)
+    nodes = _stage_nodes(template, config, text, job_id)
     document = {
         "id": plan_id or f"plan-{job_id}",
         "job_id": job_id,

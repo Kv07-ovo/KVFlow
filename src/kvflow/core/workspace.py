@@ -94,6 +94,18 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def source_digest(path: Path) -> tuple[str, int]:
+    """The canonical identity of one source file: newline-normalised bytes.
+
+    The same function decides whether a source file is unchanged later, so a
+    snapshot digest and a "was this file touched?" check can never disagree about
+    what the file's content is.
+    """
+    raw = path.read_bytes()
+    normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(normalized).hexdigest(), len(normalized)
+
+
 def copy_source_file(source: Path, destination: Path) -> tuple[str, int]:
     """Copy one source file into an owned tree with a stable, canonical digest.
 
@@ -101,12 +113,13 @@ def copy_source_file(source: Path, destination: Path) -> tuple[str, int]:
     snapshot identity is reproducible across platforms and Git checkouts instead
     of depending on the host's autocrlf setting.
     """
+    digest, size = source_digest(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     raw = source.read_bytes()
     normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    destination.parent.mkdir(parents=True, exist_ok=True)
     with open(destination, "wb") as handle:
         handle.write(normalized)
-    return hashlib.sha256(normalized).hexdigest(), len(normalized)
+    return digest, size
 
 
 def canonical_manifest(entries: Sequence[dict[str, Any]]) -> str:
