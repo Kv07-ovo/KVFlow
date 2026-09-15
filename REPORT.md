@@ -33,13 +33,21 @@ EVIDENCE (receipts in kvflow/.runtime/receipts/)
 - kvflow-protection.json: PASS - 6 protected trees of the original KVStock product,
   20,401 files, unchanged after an adapter read; writes into protected roots refused by the
   product's own config validation and path policy.
+- kvflow-refusal-recovery.json: PASS - permission refusal (write inside a protected root and
+  a traversal scope both PATH_DENIED, the approved root writable), budget refusal
+  (BUDGET_DENIED for a job cap that cannot cover one call; a fitting request is admitted),
+  recovery (an interrupted node is parked FIX, 0 open runs, 0 jobs left active).
 - kvflow-mcp-e2e.json: MCP stdio PASS (live manager plan, APPROVE, integration applied).
 
 KNOWN LIMITATIONS (not hidden)
-- web_project is PARTIAL: no node/deno/bun exists on this machine, so the registered node
-  test runner cannot execute. The leg uses a shipped source-level web checker
-  (kvflow/checks/webcheck.py) and the receipt says so; the live worker refused to claim a
-  passing test it could not run (status BLOCKED, no fabricated receipt).
+- web_project is PARTIAL. The environment blocker is gone: this machine carries a bundled
+  Node runtime that is not on PATH, and the approved web profile now pins that absolute
+  path (a shipped feature: a profile may pin an allowlisted binary), so `node --test`
+  really executes and produces receipts (build profile exit 0, test profile exit 1).
+  What still fails is the live worker's deliverable: it wrote src/app.mjs but not the
+  dekebab test file, so the test profile exits 1 and the manager answered FIX/BLOCKED,
+  twice including one provider anomaly ("returned neither content nor tool calls").
+  No receipt claims the suite passed.
 - Manager and reviewer share one model configuration in deepseek_only; that is not an
   independent third-party audit.
 - parallel_three uses a scripted plan with real workers (recorded as

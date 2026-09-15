@@ -79,16 +79,28 @@ def _resolve_executable(name: str) -> list[str]:
 
     ``python``/``python3`` always mean *this* interpreter, so a profile that asks
     for KVFlow's own checker cannot accidentally pick up another environment.
-    Everything else must exist on PATH, and a missing program is a typed refusal
-    instead of a failed run discovered halfway through.
+    Any other program is resolved from PATH, or from the absolute path the project
+    pinned when it was onboarded - a machine can carry a toolchain (a bundled Node
+    runtime, for instance) that is deliberately not on PATH, and the approved
+    profile is the right place to record exactly which binary that is. A missing
+    program is a typed refusal instead of a failed run discovered halfway through.
     """
-    key = Path(str(name)).name.casefold()
+    raw = str(name)
+    key = Path(raw).name.casefold()
     if key not in ARGV_EXECUTABLE_ALLOWLIST:
         raise ContractError("the profile's executable is not allowlisted", executable=key)
-    if key in {"python", "python3", "python.exe"}:
+    if key in {"python", "python3", "python.exe"} and not os.path.isabs(raw):
         return [os.sys.executable]
-    if key == "pytest":
+    if key == "pytest" and not os.path.isabs(raw):
         return [os.sys.executable, "-m", "pytest"]
+    if os.path.isabs(raw):
+        candidate = Path(raw)
+        if candidate.is_file():
+            return [str(candidate)]
+        raise ContractError(
+            "the profile's pinned executable does not exist on this machine",
+            executable=raw,
+        )
     found = shutil.which(key)
     if found is None:
         raise ContractError(

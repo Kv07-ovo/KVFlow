@@ -184,7 +184,69 @@ def leg_project(store: Store, name: str, project_id: str, requirement: str,
         "live_calls": (receipt.get("worker_totals") or {}).get("live_calls"),
         "usage": (receipt.get("worker_totals") or {}).get("usage"),
         "source_not_modified": receipt.get("source_not_modified"),
+        "web_runtime": web_runtime_evidence() if name == "web_project" else None,
         "problems": receipt.get("problems"),
+    }
+
+
+def web_profiles():
+    """The web project's approved profiles, on the runtime this machine really has.
+
+    A web project's strongest proof is its own test runner. This machine carries a
+    bundled Node runtime that is not on PATH, so the profile pins that absolute path
+    - the product resolves a pinned allowlisted binary instead of only looking at
+    PATH. When no Node exists at all, the source-level checker stands in and the
+    receipt says which one ran.
+    """
+    from kvflow.registry import ProfileSpec
+
+    node = WEB_NODE
+    if node is not None:
+        return [
+            ProfileSpec(id="test",
+                        description=f"the project's node --test suite via {node}",
+                        runner="argv", argv=[str(node), "--test", "test/"],
+                        timeout_seconds=600, proof="test"),
+            ProfileSpec(id="build",
+                        description=f"Node syntax check via {node}",
+                        runner="argv", argv=[str(node), "--check", "src/app.mjs"],
+                        timeout_seconds=180, proof="build"),
+        ]
+    return [
+        ProfileSpec(id="test",
+                    description=("source-level web check (no Node runtime exists on"
+                                 " this machine, so the suite cannot execute)"),
+                    runner="argv",
+                    argv=["python", "-m", "kvflow.checks.webcheck",
+                          "--require-export", "src/app.mjs:dekebab",
+                          "--require-import", "test/dekebab.test.mjs:../src/app.mjs:dekebab",
+                          "--require-test", "test/dekebab.test.mjs:dekebab"],
+                    timeout_seconds=180, proof="test"),
+    ]
+
+
+def find_web_runtime() -> Path | None:
+    """A Node runtime on PATH, or the one bundled beside this checkout."""
+    found = shutil.which("node")
+    if found:
+        return Path(found)
+    bundled = (PRODUCT.parent / "runtime").glob("node-*-win-x64/node.exe")
+    for candidate in sorted(bundled):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+WEB_NODE = find_web_runtime()
+
+
+def web_runtime_evidence() -> dict:
+    return {
+        "kind": "node" if WEB_NODE is not None else "source_check_only",
+        "path": str(WEB_NODE) if WEB_NODE is not None else None,
+        "on_path": bool(shutil.which("node")),
+        "note": ("the approved profile pins this binary" if WEB_NODE is not None
+                 else "no Node runtime exists, so the source-level checker is used"),
     }
 
 
@@ -407,14 +469,7 @@ def main() -> int:
                                   timeout_seconds=600)])
     onboard(store, paths["web-app"], template="feature", project_id="web-app-e2e",
             write_roots=["src", "test"],
-            profiles=[
-                ProfileSpec(id="test", description="the project's node --test suite",
-                            runner="argv", argv=["node", "--test", "test/"],
-                            timeout_seconds=600, proof="test"),
-                ProfileSpec(id="build", description="Node syntax check of every source file",
-                            runner="argv", argv=["node", "--check", "src/app.mjs"],
-                            timeout_seconds=180, proof="build"),
-            ])
+            profiles=web_profiles())
     onboard(store, paths["docs-data"], template="docs_or_data", project_id="docs-data-e2e",
             write_roots=["docs", "data"],
             profiles=[
