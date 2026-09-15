@@ -43,6 +43,13 @@ kvflow project show my-app
 `onboard` 会读取真实文件（语言、测试框架、可写目录），生成项目内 `kvflow.project.json`，
 由你批准后才注册；可写根与受保护路径重叠时会被直接拒绝。
 
+注册的 profile 就是该项目的“证明方式”，执行时按你批准的原样 argv 运行。两条实战经验：
+
+- 工具链不在 PATH 时（例如随项目分发的 Node），在 profile 里**固定绝对路径**：
+  `argv=["C:/.../node.exe","--test"]`；允许清单仍然生效，路径不存在会被直接拒绝。
+- Node 22 下 `node --test test/` 会把目录当成模块去 require 并以 `MODULE_NOT_FOUND` 失败，
+  而 `node --test`（自动发现）才会真正跑测试；注册 profile 时用后者。
+
 ## 3. 预览与执行
 
 ```powershell
@@ -67,7 +74,6 @@ kvflow cancel job_xxxxxxxx
 ```
 
 ## 5. 可选适配器（例如 KVStock）
-
 适配器默认全部关闭，必须显式启用，且只读：
 
 ```powershell

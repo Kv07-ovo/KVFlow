@@ -203,9 +203,13 @@ def web_profiles():
     node = WEB_NODE
     if node is not None:
         return [
+            # `node --test <dir>` is not the same as auto-discovery: on Node 22 a
+            # directory positional is loaded as a module and the run fails with
+            # MODULE_NOT_FOUND even though the suite itself passes. The approved
+            # profile records the invocation that really works.
             ProfileSpec(id="test",
                         description=f"the project's node --test suite via {node}",
-                        runner="argv", argv=[str(node), "--test", "test/"],
+                        runner="argv", argv=[str(node), "--test"],
                         timeout_seconds=600, proof="test"),
             ProfileSpec(id="build",
                         description=f"Node syntax check via {node}",
@@ -537,8 +541,12 @@ def main() -> int:
     if "web" in legs:
         results["web_project"] = leg_project(
             store, "web_project", "web-app-e2e",
-            "export a dekebab(value) helper from src/app.mjs that turns dashes back into"
-            " spaces, and add a passing test for it",
+            "Two deliverables. First, export a dekebab(value) helper from src/app.mjs that"
+            " turns dashes and underscores back into single spaces. Second, create"
+            " test/dekebab.test.mjs which imports dekebab from '../src/app.mjs' and asserts"
+            " at least one dashed input. Both files must exist, and the registered test"
+            " profile (the project's own node --test suite) must exit zero before you"
+            " claim this is done - it runs every file in test/, including the new one.",
             "feature")
         persist()
     if "isolation" in legs and results.get("python_project", {}).get("job_id"):
