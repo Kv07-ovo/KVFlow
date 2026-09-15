@@ -86,6 +86,36 @@ def main() -> int:
         if "kvflow-dsh" not in receipt["installation"][key]:
             receipt["problems"].append(f"kvflow-dsh missing from {key}")
 
+    # the profile above was bound by the product's own command, and that command's
+    # own receipt records the backup, the `dsh plugin add` step and the host's
+    # composition of the patch it wrote
+    install_receipt = PRODUCT / ".runtime" / "receipts" / "host-install.json"
+    if install_receipt.is_file():
+        try:
+            # the receipt may have been captured through a shell redirect, which on
+            # Windows writes UTF-16LE; read it whatever encoding it landed in
+            document = json.loads(read_text(install_receipt))
+        except ValueError:
+            document = {}
+        receipt["install_receipt"] = {
+            "file": str(install_receipt),
+            "action": document.get("action"),
+            "verified": document.get("verified"),
+            "backup": document.get("backup"),
+            "steps": [step.get("step") for step in document.get("steps") or []],
+            "compose_ok": any(
+                step.get("kvflow_row_composed") is True
+                for step in document.get("steps") or []
+            ),
+            "binding": (document.get("binding") or {}).get("installed"),
+        }
+        if document.get("action") != "installed" or not document.get("verified"):
+            receipt["problems"].append("the product's own install receipt is not verified")
+        if not receipt["install_receipt"]["compose_ok"]:
+            receipt["problems"].append("the host did not compose the written patch")
+    else:
+        receipt["problems"].append("no `kvflow install` receipt was found")
+
     composed = dump_config("desktop")
     receipt["composed_runtime_profile"] = {
         "row_present": "- id: kvflow" in composed and "name: kvflow-dsh" in composed,
@@ -109,7 +139,7 @@ def main() -> int:
     # each of these was a separate DSH process: a fresh boot is the restart
     receipt["host_runs"] = []
     for name, log in (("read_only_tools", "dsh-plugin-run.txt"),
-                      ("workflow_start", "dsh-plugin-run2.txt")):
+                      ("workflow_start", "dsh-plugin-run3.txt")):
         path = PRODUCT / ".runtime" / log
         text = read_text(path) if path.is_file() else ""
         receipt["host_runs"].append({
@@ -159,10 +189,13 @@ def main() -> int:
             time.sleep(5)
         else:
             receipt["problems"].append("the plugin-launched run did not finish in time")
-        if receipt["plugin_launched_run"].get("status") not in {"PASS", "PARTIAL"}:
+        if receipt["plugin_launched_run"].get("status") != "PASS":
+            # a PARTIAL child run is not proof that the plugin drives a workflow to
+            # completion; the run's own problems are recorded instead of glossed
             receipt["problems"].append(
-                f"the plugin-launched run reported "
-                f"{receipt['plugin_launched_run'].get('status')}"
+                "the plugin-launched run reported "
+                f"{receipt['plugin_launched_run'].get('status')}: "
+                f"{(receipt['plugin_launched_run'].get('problems') or [])[:3]}"
             )
 
     receipt["status"] = "PASS" if not receipt["problems"] else "PARTIAL"

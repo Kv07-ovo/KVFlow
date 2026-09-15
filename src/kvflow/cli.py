@@ -90,6 +90,12 @@ def cmd_project_onboard(args: argparse.Namespace) -> dict[str, Any]:
         write_roots=args.write_root or None,
         protected_paths=args.protect,
     )
+    if config.adapter:
+        # a project may only name an adapter this runtime home has enabled: the
+        # refusal names the command, so "why is my adapter ignored" has one answer
+        from .adapters import registry as adapters
+
+        adapters.require_enabled(home, config.adapter)
     summary = registry.approval_summary(config)
     if not args.write:
         return {
@@ -232,6 +238,126 @@ def cmd_profile_show(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------------ adapters
+
+
+def cmd_adapter_list(args: argparse.Namespace) -> dict[str, Any]:
+    """Every known optional adapter with its opt-in state. Reads nothing else."""
+    from .adapters import registry as adapters
+
+    home = _home(args)
+    rows = adapters.describe(home)
+    return {
+        "adapters": rows,
+        "enabled": [row["adapter"] for row in rows if row["enabled"]],
+        "home": str(home),
+        "policy": "optional adapters are deny-by-default and read-only",
+    }
+
+
+def cmd_adapter_enable(args: argparse.Namespace) -> dict[str, Any]:
+    """Enable one adapter for this runtime home, recording the approved roots."""
+    from .adapters import registry as adapters
+
+    home = _home(args)
+    options: dict[str, Any] = {}
+    if args.root:
+        options["root"] = str(Path(args.root).resolve())
+    if args.source:
+        options["sources"] = [json.loads(item) for item in args.source]
+    entry = adapters.enable(home, args.adapter_id, options=options,
+                            reason=args.reason or "")
+    written = adapters.describe(home)
+    return {
+        "action": "enabled",
+        "entry": entry,
+        "adapters": written,
+        "note": (
+            "enabling grants read-only access through this runtime home; the adapter"
+            " cannot write to the adapted project"
+        ),
+    }
+
+
+def cmd_adapter_disable(args: argparse.Namespace) -> dict[str, Any]:
+    from .adapters import registry as adapters
+
+    return {**adapters.disable(_home(args), args.adapter_id), "action": "disabled"}
+
+
+def cmd_adapter_show(args: argparse.Namespace) -> dict[str, Any]:
+    """What the enabled adapter can actually reach, or the refusal that says why not."""
+    from .adapters import kvstock_adapter as adapter
+
+    home = _home(args)
+    entry = adapter.enabled_entry(home, args.adapter_id)
+    return adapter.describe(entry)
+
+
+def cmd_adapter_status(args: argparse.Namespace) -> dict[str, Any]:
+    from .adapters import kvstock_adapter as adapter
+
+    entry = adapter.enabled_entry(_home(args), args.adapter_id)
+    return adapter.status(entry)
+
+
+def cmd_adapter_read(args: argparse.Namespace) -> dict[str, Any]:
+    from .adapters import kvstock_adapter as adapter
+
+    entry = adapter.enabled_entry(_home(args), args.adapter_id)
+    return adapter.read(
+        entry, args.source_key, selector=args.selector, offset=args.offset,
+        limit=args.limit, prefix=args.prefix or "", cursor=args.cursor,
+        page_limit=args.page_limit,
+    )
+
+
+# --------------------------------------------------- host install lifecycle
+
+
+def cmd_install(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind the plugin into one DSH profile, with a backup and a verification."""
+    from . import install as host_install
+
+    # The host reads this path from its profile configuration, possibly from a
+    # completely different working directory, so an install never records a
+    # cwd-relative runtime home. An explicit --home still wins.
+    home = (Path(args.home).expanduser().resolve() if args.home
+            else Path.home() / ".kvflow")
+    python = Path(args.python).resolve() if args.python else Path(sys.executable)
+    python_path = Path(args.python_path).resolve() if args.python_path else Path(
+        __file__).resolve().parents[1]
+    workspace = Path(args.workspace).resolve() if args.workspace else None
+    return host_install.install(
+        profile=args.profile, home=home, python=python, python_path=python_path,
+        workspace=workspace, version=_version(),
+        upgrade=bool(getattr(args, "upgrade", False)) or args.command == "upgrade",
+        dry_run=bool(args.dry_run),
+    )
+
+
+def cmd_uninstall(args: argparse.Namespace) -> dict[str, Any]:
+    from . import install as host_install
+
+    purge = Path(args.purge_home).resolve() if args.purge_home else None
+    return host_install.uninstall(
+        profile=args.profile, version=_version(), purge_home=purge,
+        dry_run=bool(args.dry_run),
+    )
+
+
+def cmd_host_status(args: argparse.Namespace) -> dict[str, Any]:
+    from . import install as host_install
+
+    return host_install.status(args.profile)
+
+
+def _version() -> str:
+    from . import __version__
+
+    return __version__
+
+
 # -------------------------------------------------------------------- plan
 
 
@@ -368,6 +494,57 @@ def add_product_commands(extension) -> dict[str, Callable]:
     profile_show.add_argument("profile_id", nargs="?", default=None)
     profile_show.add_argument("--budget", default=None)
 
+    adapter = add("adapter", "optional, explicitly enabled project adapters")
+    adapter_sub = adapter.add_subparsers(dest="adapter_command")
+    adapter_sub.add_parser("list")
+    adapter_enable = adapter_sub.add_parser("enable")
+    adapter_enable.add_argument("adapter_id", choices=["kvstock"])
+    adapter_enable.add_argument("--root", default=None,
+                                help="the only readable tree for this adapter")
+    adapter_enable.add_argument("--source", action="append", default=[],
+                                help="one JSON SourceSpec, repeatable")
+    adapter_enable.add_argument("--reason", default="")
+    adapter_disable = adapter_sub.add_parser("disable")
+    adapter_disable.add_argument("adapter_id", choices=["kvstock"])
+    adapter_show = adapter_sub.add_parser("show")
+    adapter_show.add_argument("adapter_id", nargs="?", default="kvstock")
+    adapter_status = adapter_sub.add_parser("status")
+    adapter_status.add_argument("adapter_id", nargs="?", default="kvstock")
+    adapter_read = adapter_sub.add_parser("read")
+    adapter_read.add_argument("source_key")
+    adapter_read.add_argument("--adapter", dest="adapter_id", default="kvstock")
+    adapter_read.add_argument("--selector", default=None)
+    adapter_read.add_argument("--prefix", default=None)
+    adapter_read.add_argument("--cursor", default=None)
+    adapter_read.add_argument("--offset", type=int, default=0)
+    adapter_read.add_argument("--limit", type=int, default=4096)
+    adapter_read.add_argument("--page-limit", type=int, default=50)
+
+    install_cmd = add("install", "bind the plugin into one DSH profile")
+    install_cmd.add_argument("--profile", default=None)
+    install_cmd.add_argument("--python", default=None,
+                             help="the interpreter the host plugin should run")
+    install_cmd.add_argument("--python-path", default=None,
+                             help="the import root for that interpreter")
+    install_cmd.add_argument("--workspace", default=None,
+                             help="default workspace directory for the host tools")
+    install_cmd.add_argument("--dry-run", action="store_true")
+    upgrade_cmd = add("upgrade", "re-install the plugin after the checkout changed")
+    upgrade_cmd.add_argument("--profile", default=None)
+    upgrade_cmd.add_argument("--python", default=None)
+    upgrade_cmd.add_argument("--python-path", default=None)
+    upgrade_cmd.add_argument("--workspace", default=None)
+    upgrade_cmd.add_argument("--dry-run", action="store_true")
+    uninstall_cmd = add("uninstall", "detach the plugin, restoring the profile files")
+    uninstall_cmd.add_argument("--profile", default=None)
+    uninstall_cmd.add_argument("--purge-home", default=None,
+                               help="report (never delete) this runtime home")
+    uninstall_cmd.add_argument("--dry-run", action="store_true")
+    host = add("host", "the DSH host integration status")
+    host_sub = host.add_subparsers(dest="host_command")
+    host_status = host_sub.add_parser("status")
+    host_status.add_argument("--profile", default=None)
+
     plan = add("plan", "compile a template into a DAG without running it")
     plan.add_argument("requirement")
     plan.add_argument("--project", dest="project_id", required=True)
@@ -409,6 +586,20 @@ def add_product_commands(extension) -> dict[str, Callable]:
             "list": cmd_profile_list,
             "show": cmd_profile_show,
         }[getattr(args, "profile_command", None) or "list"](args),
+        "adapter": lambda args: {
+            "list": cmd_adapter_list,
+            "enable": cmd_adapter_enable,
+            "disable": cmd_adapter_disable,
+            "show": cmd_adapter_show,
+            "status": cmd_adapter_status,
+            "read": cmd_adapter_read,
+        }[getattr(args, "adapter_command", None) or "list"](args),
+        "install": cmd_install,
+        "upgrade": cmd_install,
+        "uninstall": cmd_uninstall,
+        "host": lambda args: {
+            "status": cmd_host_status,
+        }[getattr(args, "host_command", None) or "status"](args),
         "plan": cmd_plan,
         "run": cmd_run,
         "runs": cmd_runs,

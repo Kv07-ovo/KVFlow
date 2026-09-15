@@ -639,7 +639,27 @@ def parse(
     return command, namespace, extra_commands
 
 
+def _make_output_encoding_safe() -> None:
+    """Never lose a command result to the console code page.
+
+    A Windows console is often a legacy code page (GBK here), and a payload that
+    quotes a tool's own output can contain characters that code page cannot
+    encode. Printing would then raise after the work had already succeeded, which
+    turns a completed install into a crash report. Reconfiguring the stream keeps
+    the data and replaces only what the console genuinely cannot show.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):  # pragma: no cover - a redirected exotic stream
+            continue
+
+
 def main(argv: Sequence[str] | None = None, extra: Callable | None = None) -> int:
+    _make_output_encoding_safe()
     command, args, extra_commands = parse(argv, extra)
     if command == "version":
         print(f"kvflow {PRODUCT_VERSION}")

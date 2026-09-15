@@ -1,6 +1,4 @@
-Call the tool `kvflow_start` exactly once. Use exactly these arguments:
-
-{"requirement": "add a cube(a) helper to src/calc.py and prove it with the registered test profile", "project_id": "demo-python-api-fdd9235b", "template": "feature"}
+Call the tool `kvflow_start` exactly once, with exactly these arguments: requirement="add a cube(a) helper to src/calc.py and prove it with the registered test profile", project_id="demo-python-api-163aa7cc", template="feature".
 
 Rules:
 - Do not call any other tool.

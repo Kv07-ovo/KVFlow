@@ -422,7 +422,11 @@ def compile_project(
                 project_id=config.project_id,
                 description=spec.description,
                 runner=spec.runner,
-                targets=spec.targets or ["."],
+                # an argv profile declares its whole command line; only a runner
+                # profile has targets, and a runner profile needs at least one
+                targets=spec.targets if spec.targets else (
+                    [] if spec.runner == "argv" else ["."]
+                ),
                 cwd=spec.cwd,
                 pythonpath=spec.pythonpath,
                 timeout_seconds=spec.timeout_seconds,

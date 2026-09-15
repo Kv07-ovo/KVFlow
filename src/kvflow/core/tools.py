@@ -603,6 +603,15 @@ class ToolService:
         for entry in profile.pythonpath:
             candidate = workspace_read_target(handle, entry)
             roots.append(str(candidate))
+        if profile.runner == "argv":
+            # A fixed-argv profile may run one of the product's own commands (the
+            # artifact checker is the shipped example). The child gets a controlled
+            # environment, so the product's own import root has to be added here or
+            # `python -m kvflow...` cannot be found from a source checkout. This is
+            # the product's own path, never a caller-supplied one.
+            package_root = str(Path(__file__).resolve().parents[2])
+            if package_root not in roots:
+                roots.append(package_root)
         env["PYTHONPATH"] = os.pathsep.join(roots)
         # credentials are never inherited by a test child
         for forbidden in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "HTTPS_PROXY",

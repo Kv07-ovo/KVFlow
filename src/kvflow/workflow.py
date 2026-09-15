@@ -41,6 +41,7 @@ from .core.knowledge import KnowledgeQuery, KnowledgeService
 from .core.mcp_server import TOOL_SPECS
 from .core.scheduler import Scheduler
 from .core.security import CapabilityAuthority
+from .core.state import TaskState
 from .core.store import Store, utcnow
 from .core.tools import ToolService
 from .core.worker import WorkerLoop
@@ -49,6 +50,9 @@ from .core.workspace import WorkspaceManager, source_digest
 GLOBAL_SCOPE = "kvflow-global"
 #: every run is bounded twice: by the profile's caps and by this wall-clock ceiling
 MAX_RUN_SECONDS = 3_600.0
+#: one initial implementation pass plus at most this many manager-directed reworks,
+#: matching the durable worker attempt budget (first attempt + two reworks)
+MAX_FIX_ROUNDS = 2
 RUNS_DIR = "runs"
 
 
@@ -137,21 +141,25 @@ def _scopes(ledger: BudgetLedger, config: registry.ProjectConfig,
             )
         )
     job_scope = f"job-{job_id}"
-    ledger.register_scope(
-        BudgetScope(
-            scope_id=job_scope, scope_kind="JOB", parent_scope_id=project_scope,
-            project_id=config.project_id, job_id=job_id,
-            calls=max(2, int(profile["calls"])), input_tokens=int(profile["input_tokens"]),
-            output_tokens=int(profile["output_tokens"]),
-            tool_calls=int(profile["tool_calls"]),
-            storage_bytes=int(profile["storage_bytes"]),
-            wall_seconds=min(int(profile["wall_seconds"]), int(MAX_RUN_SECONDS)),
-            micro_cny=int(profile["micro_cny"]),
-            concurrency=min(3, int(profile["concurrency"])),
-            deadline=registry.deadline_from(profile),
-            authorization_digest=config_digest(config),
+    if missing(job_scope):
+        # idempotent on purpose: a resumed run, a second runner process or any
+        # re-entry must reuse the scope it already registered, because a scope's
+        # caps and deadline are frozen once they exist
+        ledger.register_scope(
+            BudgetScope(
+                scope_id=job_scope, scope_kind="JOB", parent_scope_id=project_scope,
+                project_id=config.project_id, job_id=job_id,
+                calls=max(2, int(profile["calls"])), input_tokens=int(profile["input_tokens"]),
+                output_tokens=int(profile["output_tokens"]),
+                tool_calls=int(profile["tool_calls"]),
+                storage_bytes=int(profile["storage_bytes"]),
+                wall_seconds=min(int(profile["wall_seconds"]), int(MAX_RUN_SECONDS)),
+                micro_cny=int(profile["micro_cny"]),
+                concurrency=min(3, int(profile["concurrency"])),
+                deadline=registry.deadline_from(profile),
+                authorization_digest=config_digest(config),
+            )
         )
-    )
     return {"global": GLOBAL_SCOPE, "project": project_scope, "job": job_scope}
 
 
@@ -334,13 +342,22 @@ def _run_wave(
     handles: dict[str, Any], dependencies: Mapping[str, Sequence[str]], provider: Any,
     max_steps: int, max_completion_tokens: int, max_parallel: int, lock: threading.Lock,
     results: dict[str, dict[str, Any]],
+    feedback: Mapping[str, str] | None = None,
 ) -> None:
-    """Run one dependency wave: every node runs, at most ``max_parallel`` at once."""
+    """Run one dependency wave: every node runs, at most ``max_parallel`` at once.
+
+    ``feedback`` carries the manager's findings back into the objective of a node
+    that is being reworked, so a retry is a repair attempt and not a repeat of the
+    same prompt.
+    """
     node_by_id = {node.id: node for node in plan.nodes}
     job_id = plan.job_id
 
     def work(node_id: str) -> None:
         node = node_by_id[node_id]
+        objective = node.objective
+        if feedback and feedback.get(node_id):
+            objective = f"{objective}\n\n{feedback[node_id]}"
         started = time.monotonic()
         report: dict[str, Any] = {
             "node_id": node_id, "status": "EXECUTOR_ERROR",
@@ -351,7 +368,13 @@ def _run_wave(
             for dependency in dependencies.get(node_id, ()):
                 if dependency in handles:
                     base = handles[dependency]
-            if base is not None:
+            if node_id in handles:
+                # A rework re-dispatch keeps the tree the manager reviewed, so the
+                # repair builds on the reviewed bytes instead of redoing the work.
+                # A second workspace for the same node is refused by the store, and
+                # a fresh tree would also throw away the diff under review.
+                handle = handles[node_id]
+            elif base is not None:
                 handle = manager_ws.create_workspace_from(
                     job_id=job_id, node_id=node_id, base_handle=base,
                     scopes=list(node.write_scopes) or ["."],
@@ -380,7 +403,7 @@ def _run_wave(
                 max_steps=max_steps, max_completion_tokens=max_completion_tokens,
                 max_seconds=900.0,
             )
-            outcome = loop.run(node.objective)
+            outcome = loop.run(objective)
             if outcome.status == "WORKER_COMPLETE":
                 scheduler.complete(claim, summary=outcome.summary[:300])
             else:
@@ -511,19 +534,125 @@ def execute_run(
     results: dict[str, dict[str, Any]] = {}
     lock = threading.Lock()
     dependencies = {node.id: tuple(node.dependencies) for node in plan.nodes}
-    for wave in planner.parallel_groups(plan):
-        _run_wave(
-            node_ids=wave, plan=plan, project=project, store=store, scheduler=scheduler,
-            authority=authority, tools=tools, ledger=ledger, scope_id=scope_ids["job"],
-            manager_ws=manager_ws, snapshot=snapshot, handles=handles,
-            dependencies=dependencies, provider=provider, max_steps=max_steps,
-            max_completion_tokens=max_completion_tokens,
-            max_parallel=template.max_parallel_workers, lock=lock, results=results,
-        )
+    feedback: dict[str, str] = {}
+    rounds: list[dict[str, Any]] = []
+    verdict = None
+    diff: dict[str, Any] = {"changed": [], "content_digest": ""}
+    receipts: list[dict[str, Any]] = []
+
+    # One initial pass plus at most MAX_FIX_ROUNDS reworks, which is the same bound
+    # the durable attempt counter enforces. A node the manager sent back is
+    # re-dispatched with the findings in its objective; a node that exhausted its
+    # attempts is refused by the scheduler and the refusal is recorded.
+    for round_index in range(0, MAX_FIX_ROUNDS + 1):
+        if round_index == 0:
+            waves = planner.parallel_groups(plan)
+        else:
+            ready = scheduler.evaluate(job_id)["ready"]
+            if not ready:
+                break
+            waves = [ready]
+        for wave in waves:
+            _run_wave(
+                node_ids=wave, plan=plan, project=project, store=store,
+                scheduler=scheduler, authority=authority, tools=tools, ledger=ledger,
+                scope_id=scope_ids["job"], manager_ws=manager_ws, snapshot=snapshot,
+                handles=handles, dependencies=dependencies, provider=provider,
+                max_steps=max_steps, max_completion_tokens=max_completion_tokens,
+                max_parallel=template.max_parallel_workers, lock=lock, results=results,
+                feedback=feedback,
+            )
+        rounds.append({
+            "round": round_index,
+            "nodes": list(wave) if waves else [],
+            "states": {key: value.value for key, value in scheduler.node_states(job_id).items()},
+        })
+
+        latest_handle = handles.get(plan.nodes[-1].id) or next(iter(handles.values()), None)
+        diff = manager_ws.workspace_diff(latest_handle) if latest_handle else {
+            "changed": [], "content_digest": ""
+        }
+        for change in diff.get("changed", []):
+            change.pop("base_sha256", None)
+            path = (latest_handle.root / change["relative_path"]) if latest_handle else None
+            if path is not None and path.is_file() and path.stat().st_size <= 200_000:
+                body = path.read_text(encoding="utf-8", errors="replace")
+                change["content_preview"] = body[:6000]
+                change["content_bytes"] = len(body.encode("utf-8"))
+        receipts = store.receipts(job_id)
+
+        verdict = None
+        if template.review == "manager" and manager is not None:
+            try:
+                verdict = manager.review(
+                    objective=plan.objective, acceptance=list(plan.acceptance), diff=diff,
+                    receipts=receipts, content_digest=diff.get("content_digest") or "",
+                )
+                run["review"] = verdict.to_dict()
+            except V1Error as exc:
+                run["review"] = {"verdict": "REFUSED",
+                                 "error": f"{type(exc).__name__}: {exc}"}
+        elif template.review == "manager":
+            run["review"] = {"verdict": "NOT_RUN",
+                             "reason": manager_error or "no manager is available"}
+        else:
+            run["review"] = {"verdict": "NOT_REQUIRED", "reason": f"template {template.id}"}
+
+        if verdict is not None and verdict.verdict == "APPROVE":
+            # An approval decides the review, not the node lifecycle. A node whose
+            # worker call ended OUTCOME_UNKNOWN is still claimable, and a run that
+            # leaves a claimable node behind is not settled -- the run would be
+            # integrated from a state the scheduler does not consider finished. So
+            # the same bounded rework rounds are used to settle it first, and the
+            # settled result is reviewed again before anything is integrated.
+            unsettled = scheduler.evaluate(job_id)["ready"]
+            if not unsettled or round_index >= MAX_FIX_ROUNDS:
+                break
+            feedback = {
+                node_id: (
+                    "The manager reviewed this node's earlier output and approved the"
+                    " direction, but the node has no settled outcome: its last attempt"
+                    " ended without completing (for example because a provider call"
+                    " timed out). Finish this node and prove the result with the"
+                    " registered profile; do not change work the manager already"
+                    " accepted unless it is wrong."
+                )
+                for node_id in unsettled
+            }
+            continue
+        if round_index >= MAX_FIX_ROUNDS:
+            break
+        if template.review != "manager":
+            break
+        states = scheduler.node_states(job_id)
+        reviewed = [
+            node.id for node in plan.nodes
+            if states.get(node.id) in {TaskState.WORKER_COMPLETE, TaskState.FIX}
+        ]
+        _reopen_for_rework(store, job_id, reviewed)
+        ready = scheduler.evaluate(job_id)["ready"]
+        if not ready:
+            break
+        findings = list((run.get("review") or {}).get("findings") or [])[:10]
+        feedback = {
+            node_id: (
+                "A previous attempt of this node was reviewed and sent back for rework."
+                " Address exactly these findings, then prove the result with the"
+                " registered profile:\n- " + "\n- ".join(findings)
+            )
+            for node_id in ready
+        } if findings else {
+            node_id: (
+                "A previous attempt of this node was reviewed and sent back for rework."
+                " Finish the outstanding work and prove it with the registered profile."
+            )
+            for node_id in ready
+        }
 
     run["node_reports"] = {key: results[key] for key in sorted(results)}
     run["node_states_final"] = {key: value.value
                                 for key, value in scheduler.node_states(job_id).items()}
+    run["rounds"] = rounds
     run["worker_totals"] = {
         "live_calls": sum(report.get("live_calls", 0) for report in results.values()),
         "tool_calls": sum(report.get("tool_calls", 0) for report in results.values()),
@@ -533,18 +662,6 @@ def execute_run(
                         "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
         },
     }
-    latest_handle = handles.get(plan.nodes[-1].id) or next(iter(handles.values()), None)
-    diff = manager_ws.workspace_diff(latest_handle) if latest_handle else {
-        "changed": [], "content_digest": ""
-    }
-    for change in diff.get("changed", []):
-        change.pop("base_sha256", None)
-        path = (latest_handle.root / change["relative_path"]) if latest_handle else None
-        if path is not None and path.is_file() and path.stat().st_size <= 200_000:
-            body = path.read_text(encoding="utf-8", errors="replace")
-            change["content_preview"] = body[:6000]
-            change["content_bytes"] = len(body.encode("utf-8"))
-    receipts = store.receipts(job_id)
     run["diff"] = {"changed": [change["relative_path"] for change in diff.get("changed", [])],
                    "content_digest": diff.get("content_digest")}
     run["test_receipts"] = [
@@ -554,24 +671,6 @@ def execute_run(
     ]
     if not receipts:
         run["problems"].append("no executor test receipt was produced")
-
-    verdict = None
-    if template.review == "manager" and manager is not None:
-        try:
-            verdict = manager.review(
-                objective=plan.objective, acceptance=list(plan.acceptance), diff=diff,
-                receipts=receipts, content_digest=diff.get("content_digest") or "",
-            )
-            run["review"] = verdict.to_dict()
-        except V1Error as exc:
-            run["review"] = {"verdict": "REFUSED", "error": f"{type(exc).__name__}: {exc}"}
-            run["problems"].append(f"manager review refused: {type(exc).__name__}")
-    elif template.review == "manager":
-        run["review"] = {"verdict": "NOT_RUN",
-                         "reason": manager_error or "no manager is available"}
-        run["problems"].append("the manager review did not run")
-    else:
-        run["review"] = {"verdict": "NOT_REQUIRED", "reason": f"template {template.id}"}
 
     run["integration"] = {"applied": [], "skipped": True,
                           "reason": "the manager did not approve the change"}
@@ -609,7 +708,6 @@ def execute_run(
             run["integration"] = {"applied": [], "skipped": True,
                                   "reason": f"{type(exc).__name__}: {exc}"}
             run["problems"].append(f"integration refused: {type(exc).__name__}")
-
     _record_knowledge(store, project_id=project_id, job_id=job_id, run=run, receipts=receipts)
     run["budget"] = {"scopes": scope_ids, "job_usage": ledger.usage(scope_ids["job"])}
     run["source_not_modified"] = _source_intact(config, snapshot)
@@ -691,6 +789,30 @@ def run_requirement(
 
 
 # ------------------------------------------------------- knowledge/status
+
+
+def _reopen_for_rework(store: Store, job_id: str, node_ids: Sequence[str]) -> list[str]:
+    """Move reviewed nodes back to FIX so a rejected result can be reworked.
+
+    A node that reached a milestone is not claimable, and the durable lifecycle
+    says how it may legally go back to work: WORKER_COMPLETE -> MANAGER_REVIEW ->
+    FIX. Nothing here resets the attempt counter, so the rework is still bounded by
+    the retry budget the lineage already carries.
+    """
+    from .core.state import parse_state
+    from .core.state import TaskState as CoreState
+
+    reopened: list[str] = []
+    for node_id in node_ids:
+        state = parse_state(store.node(job_id, node_id)["state"])
+        if state is CoreState.WORKER_COMPLETE:
+            store.set_node_state(job_id, node_id, state, CoreState.MANAGER_REVIEW,
+                                 actor="scheduler")
+            state = CoreState.MANAGER_REVIEW
+        if state is CoreState.MANAGER_REVIEW:
+            store.set_node_state(job_id, node_id, state, CoreState.FIX, actor="scheduler")
+            reopened.append(node_id)
+    return reopened
 
 
 def _record_knowledge(store: Store, *, project_id: str, job_id: str, run: dict,
