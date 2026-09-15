@@ -1,64 +1,60 @@
 PRODUCT=KVFlow
 VERSION=0.1.0
 RELEASE_STATUS=PARTIAL
-SUPPORTED_SCOPE=Registered trusted projects; managed workspaces and integration trees; Python, Node/Web and docs/data toolchains; KVStock reachable read-only through an explicitly enabled adapter
 
-SEMANTIC_COORDINATION=PASS
-DUPLICATE_SIDE_EFFECT_PROTECTION=PASS
-OPTIMISTIC_CONCURRENCY=PASS
-SINGLE_WRITER_CONTRACTS=PASS
-STALE_RESULT_REJECTION=PASS
-SEMANTIC_CONTRACTS=PASS
-CONTRACT_CHANGE_PROTOCOL=PASS
-DECISION_LEDGER=PASS
-ARTIFACT_DEPENDENCIES=PASS
-GLOBAL_INVARIANTS=PASS
-USER_REQUIREMENT_TRACEABILITY=PASS
-INDEPENDENT_VALIDATION=PASS
-UNKNOWN_OUTCOME_HANDLING=PASS
-FAIL_CLOSED=PASS
-
-TEXTUAL_INTEGRATION=PASS
-SEMANTIC_INTEGRATION=PASS
-BEHAVIORAL_INTEGRATION=PASS
-
-CROSS_PROJECT_E2E=PASS(every leg has a PASS receipt; the newest run is PARTIAL for python and parallel_three because a live worker declared BLOCKED - a model outcome, not a product refusal)
-THREE_WORKER_DAG=PASS
-MCP_E2E=PASS
-DSH_PLUGIN=PASS
-DSH_RESTART_PERSISTENCE=PASS(fresh headless profile boots; not the running desktop instance)
-PROJECT_ISOLATION=PASS
-
-PERMISSION_MODEL=PASS
-BUDGET_ENFORCEMENT=PASS
-CANCEL_RESTART_RECOVERY=PASS
-BACKUP_RESTORE=PASS
+FINAL_RELEASE_COMMIT=(this commit; see below)
 
 DURABILITY_4H=PARTIAL
-ACTUAL_SOAK_DURATION=3.03h in one continuous process + 0.61h and still growing in a continuation process; not yet one continuous 4h run
-SOAK_ERRORS=0 error events in both persisted receipts; the continuation console counter shows 3 internal retries
-SQLITE_INTEGRITY=ok (every sample in both runs)
+LONGEST_CONTINUOUS_SOAK=3.03h (one process, cycles to 3260, integrity ok, orphan 0)
+TOTAL_OBSERVED_SOAK=3.89h = 3.03h + 0.86h continuation (second process, still running as pid 41892)
+SOAK_ERRORS=0 error events in both persisted receipts; 3 internal retries counted by the continuation runner
+SQLITE_INTEGRITY=ok on every sample of both runs
 ORPHAN_RUNS=0
-RESOURCE_GROWTH=rss 78-85 MB, db ~8 MB/40 MB, no leak observed; reservations and pending operations settle to 0
+RESOURCE_GROWTH=BOUNDED (rss 79-86 MB flat, db 8-11 MB, root ~25 MB; reservations and pending operations settle to 0)
+NOTE=a fresh continuous 4h soak was restarted at 14:32 local (pid 60404, root .agent_os_runtime/soak-4h-release; the first attempt failed because a relative --root produced a non-absolute project root and was restarted with an absolute path). It needs 4:00:00 of real time, so the gate item is not met in this session.
 
-README_STATUS_SYNC=PASS
+DSH_DAILY_PROFILE_RESTART=WAITING_FOR_SAFE_POINT
+- 8 DSH processes are running and this very session is an active DSH coding task with an armed goal; restarting the daily instance would kill in-flight work, so it was not forced.
+DSH_RESTART_PERSISTENCE=NOT_PROVEN_FOR_DAILY_PROFILE
+- the installed profile is intact and composes: host status reports dependency+bundle+patch row present, `dsh --dump-config` composes the kvflow row (evidence: host-install.json, dsh-plugin-acceptance.json)
+- restart-level proof exists only for a fresh headless profile process, not for the restarted daily desktop profile
+DSH_READ_ONLY_TASK=NOT_RUN_AFTER_DAILY_RESTART (blocked by the item above)
+DSH_MANAGED_WRITE_TASK=NOT_RUN_AFTER_DAILY_RESTART (the earlier headless acceptance did drive a managed write to PASS: job_e874cd7a2df642408df8, receipt exit 0, APPROVE, integration applied)
 
-KVSTOCK_PROTECTED=PASS
-FORWARD_PROTECTION_SCOPE=KNOWN_PATHS_ONLY
-GOLDEN_PROTECTED=PASS(golden_reference is one of the 6 fingerprinted trees)
+FINAL_CROSS_PROJECT_E2E=PASS (single round, same release candidate, problems=[])
+PYTHON_E2E=PASS (impl_test WORKER_COMPLETE, APPROVE, 6 live calls)
+WEB_E2E=PASS (real `node --test` exit 0 via the pinned bundled Node, APPROVE, 6 live calls)
+DOCS_DATA_E2E=PASS (artifact profile exit 0, APPROVE, 17 live calls)
+THREE_WORKER_E2E=PASS (alpha/beta/gamma real overlapping workers + dependent merge)
+PROJECT_ISOLATION=PASS (no file, knowledge, artifact or budget bleed)
 
-TESTS=351 passed (kvflow/tests)
-REAL_MODEL_E2E=cross-project legs, MCP E2E and the DSH plugin acceptance ran against the live model
-FAULT_INJECTION_E2E=PASS 13/13 (kvflow-semantic-e2e.json: the 12 required scenarios plus restart durability)
+FINAL_RELIABILITY_SMOKE=PASS (7/7: CAS conflict, duplicate idempotency, stale result, semantic mismatch, failed requirement blocks DONE, unknown outcome without blind retry, single-writer protection)
+
+BACKUP_RESTORE_FINAL=PASS (two homes round-tripped; restored semantic fingerprint identical: 3 contracts, 1 decision, 3 operations, 4 requirements, 1 invariant, 1 submission; 5 jobs and 10 receipts identical; no model call, no side effect replayed, no task resumed)
+MCP_E2E=PASS (receipt from this candidate)
+PLUGIN_E2E=PASS (fresh headless boot, verified install)
+INSTALL_UPGRADE_UNINSTALL=PASS (install/upgrade with backup+rollback, uninstall restores the profile)
+
+README_STATUS_SYNC=PASS (no "in progress"/"not started" rows remain)
+DOC_COMMAND_VALIDATION=PASS (doctor, runs, profile list, template list, project list, mcp status, host status, coordinate show/gate, backup exercised against the real runtime)
+NOTE=one mistyped PowerShell variable made a command use C:\Users\90428 as its runtime home, creating a stray kvflow.sqlite3 and workspace directory there; both were removed immediately and no product code was involved.
+
+KVSTOCK_PROTECTED=PASS (6 trees, 20,401 files unchanged; writes refused)
+GOLDEN_PROTECTED=PASS (golden_reference is one of the fingerprinted trees)
+FORWARD_PROTECTION_SCOPE=KNOWN_PATHS_ONLY (no Forward tree exists in this restored checkout; no private-disk scan was performed)
+
+TESTS=351 passed (kvflow/tests) at this code identity; the release-gate tooling added afterwards is not part of that count
 
 KNOWN_LIMITATIONS
-- The 4h durability soak is not yet proven as one continuous run: 3.03h in the first process, then a continuation that is still running. Reported PARTIAL, never as 4h.
-- No Forward tree exists in this restored checkout, so Forward coverage is KNOWN_PATHS_ONLY; nothing was scanned outside the configured project paths.
-- The daily DSH instance was not restarted; restart-level acceptance used a fresh headless profile process.
+- DURABILITY_4H: no single continuous 4-hour run yet; the restarted soak needs real time.
+- DSH daily-instance restart, and therefore the read-only and managed-write tasks through the restarted daily profile, are not proven for the daily instance (safe point not reached; nothing was force-killed).
+- FORWARD_PROTECTION_SCOPE stays KNOWN_PATHS_ONLY.
 - deepseek_only puts manager and reviewer on one model configuration: INDEPENDENT_EXECUTION_PATH, never an independent third-party audit.
-- The newest cross-project run has two PARTIAL legs caused by live-model BLOCKED decisions; earlier runs of those legs passed and both receipts are kept.
-- This round found and fixed two real defects: three entrances resolved different runtime databases (now one canonical kvflow.sqlite3 with in-place migration), and the DSH profile patch could be written as invalid YAML (now composed by the host before an install may succeed).
+- Live-model variance is real and kept in the ledger: earlier rounds had legs PARTIAL/BLOCKED; the final round above is a clean single-round PASS.
+
+SUPPORTED_SCOPE=single machine, the measured Windows environment, trusted registered projects, the measured worker concurrency (3), the current provider configuration, the current DSH compatibility version
 
 RECOMMENDATION=PARTIAL
-- Mature for daily use on registered trusted projects: the consistency layer is implemented and proven, the prior capabilities still pass, and nothing unproven is claimed.
-- Before READY_FOR_DAILY_USE: finish one continuous 4h soak, restart the daily DSH instance against the installed plugin, and re-run the cross-project legs to a clean PASS in one single run.
+Remaining real blockers, and nothing else:
+1. Let the restarted continuous soak finish 4:00:00 and re-check errors/integrity/orphans/growth.
+2. Restart the daily DSH profile at a safe point and re-run the read-only and managed-write tasks through it.
