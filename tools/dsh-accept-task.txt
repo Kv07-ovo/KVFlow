@@ -1,0 +1,8 @@
+Call the tool `kvflow_start` exactly once. Use exactly these arguments:
+
+{"requirement": "add a cube(a) helper to src/calc.py and prove it with the registered test profile", "project_id": "demo-python-api-fdd9235b", "template": "feature"}
+
+Rules:
+- Do not call any other tool.
+- Do not inspect the repository yourself.
+- After the call, print the job_id and the node ids from the result, and nothing else.

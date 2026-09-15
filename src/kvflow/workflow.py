@@ -25,6 +25,7 @@ consumed durably, and an unknown outcome stays unknown.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -811,3 +812,129 @@ def _paths(home: str | Path) -> dict[str, Path]:
     from .core import cli as core_cli
 
     return core_cli.runtime_paths(str(home))
+
+
+# ------------------------------------------------------------- run lifetime
+
+
+def runner_log_path(home: str | Path, job_id: str) -> Path:
+    return runs_dir(home) / f"{job_id}.log"
+
+
+def launch_run(
+    home: str | Path,
+    job_id: str,
+    *,
+    mode: str = "auto",
+    max_steps: int = 10,
+    max_completion_tokens: int = 1024,
+) -> dict:
+    """Start a prepared run so it outlives the caller.
+
+    ``process`` launches a detached child: the strongest form, because the run
+    survives the host that started it. Some sandboxes put every descendant in a
+    job object that kills the tree when the session ends; that is detected within
+    seconds and reported, and ``auto`` then falls back to ``inline``, which runs
+    the workflow in a background thread of the calling process. An inline run
+    still never blocks the call, but it depends on the host staying alive -- and
+    the record says which one was used instead of implying the stronger promise.
+    """
+    if mode == "inline":
+        return _launch_inline(home, job_id, max_steps, max_completion_tokens)
+    if mode not in {"auto", "process"}:
+        raise ContractError("unknown runner mode", mode=mode)
+
+    import subprocess
+    import sys
+    import time as _time
+
+    log = runner_log_path(home, job_id)
+    argv = [
+        sys.executable, "-m", "kvflow.runner", "--home", str(home), "--job", job_id,
+        "--max-steps", str(int(max_steps)),
+        "--max-completion-tokens", str(int(max_completion_tokens)),
+    ]
+    env = dict(os.environ)
+    package_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        [package_root] + [part for part in env.get("PYTHONPATH", "").split(os.pathsep) if part]
+    )
+    env["PYTHONIOENCODING"] = "utf-8"
+    creationflags = 0
+    if os.name == "nt":  # pragma: no cover - platform specific
+        creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    with open(log, "ab") as handle:
+        process = subprocess.Popen(  # noqa: S603 - fixed argv, never a shell
+            argv, stdin=subprocess.DEVNULL, stdout=handle, stderr=handle, env=env,
+            cwd=str(home), creationflags=creationflags, close_fds=True,
+        )
+    update_manifest(home, job_id, runner_mode="process", runner_pid=process.pid,
+                    runner_started_at=utcnow().isoformat(), runner_log=str(log))
+    _time.sleep(3.0)
+    if process.poll() is not None:
+        detail = {
+            "mode_requested": mode,
+            "process_exit_code": process.poll(),
+            "log": str(log),
+            "note": (
+                "the detached runner did not survive this sandbox's process"
+                " containment; the run continues inline in the calling process"
+            ),
+        }
+        return {**detail, **_launch_inline(home, job_id, max_steps, max_completion_tokens)}
+    return {"mode": "process", "pid": process.pid, "log": str(log)}
+
+
+def _launch_inline(home: str | Path, job_id: str, max_steps: int,
+                   max_completion_tokens: int) -> dict:
+    import threading
+    import traceback
+
+    log = runner_log_path(home, job_id)
+
+    def work() -> None:
+        try:
+            execute_run(job_id=job_id, home=home, max_steps=max_steps,
+                        max_completion_tokens=max_completion_tokens)
+        except BaseException as exc:  # noqa: BLE001 - the failure belongs in the record
+            detail = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            try:
+                with open(log, "a", encoding="utf-8") as handle:
+                    handle.write(detail)
+                update_manifest(home, job_id, runner_error=detail[:2000],
+                                runner_failed_at=utcnow().isoformat())
+            except Exception:  # noqa: BLE001 - never mask the original failure
+                pass
+
+    thread = threading.Thread(target=work, name=f"kvflow-{job_id}", daemon=True)
+    thread.start()
+    update_manifest(home, job_id, runner_mode="inline",
+                    runner_started_at=utcnow().isoformat(), runner_log=str(log))
+    return {
+        "mode": "inline",
+        "thread": thread.name,
+        "log": str(log),
+        "note": (
+            "this run depends on the caller staying alive; cancel stops it once the"
+            " cancellation reaches the durable state"
+        ),
+    }
+
+
+def stop_run(home: str | Path, job_id: str) -> dict:
+    """Stop exactly the process this run started, and say what happened."""
+    try:
+        manifest = run_manifest(home, job_id)
+    except V1Error:
+        return {"stopped": False, "reason": "no run manifest"}
+    if (manifest.get("runner_mode") or "") != "process":
+        return {"stopped": False, "mode": manifest.get("runner_mode"),
+                "reason": "this run has no separate process to stop"}
+    pid = manifest.get("runner_pid")
+    if not pid:
+        return {"stopped": False, "reason": "this run recorded no process id"}
+    try:
+        os.kill(int(pid), 15)
+    except OSError as exc:
+        return {"stopped": False, "pid": pid, "reason": str(exc)}
+    return {"stopped": True, "pid": pid}

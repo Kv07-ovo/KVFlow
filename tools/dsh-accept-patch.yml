@@ -1,0 +1,10 @@
+# Boot-time overlay for the KVFlow acceptance profile.
+#
+# `--patch` is applied after the profile layer, so this file lets the acceptance
+# run point the plugin at the product checkout without editing the profile.
+- id: kvflow
+  config:
+    home: C:/Users/90428/Desktop/KVStock-restored/kvflow/.runtime/smoke/home
+    python: C:/Users/90428/Desktop/KVStock-restored/kvstock-platform/agent_os/releases/1.0.0-rc1/.venv/Scripts/python.exe
+    pythonPath: C:/Users/90428/Desktop/KVStock-restored/kvflow/src
+    workspace: C:/Users/90428/Desktop/KVStock-restored/kvflow/.runtime/smoke/demo-python-api

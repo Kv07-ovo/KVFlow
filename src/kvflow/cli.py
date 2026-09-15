@@ -273,6 +273,51 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 # ------------------------------------------------------------------ wiring
 
 
+def cmd_bridge(args: argparse.Namespace) -> dict[str, Any]:
+    """Call one KVFlow tool by name with JSON arguments.
+
+    This is the entrance a host plugin uses: the plugin stays a thin adapter and
+    the tool implementation lives in exactly one place (:mod:`kvflow.api`), which
+    the MCP server also serves.
+    """
+    from . import api
+
+    try:
+        arguments = json.loads(args.args) if args.args else {}
+    except ValueError as exc:
+        raise ConfigError("--args must be a JSON object", problem=str(exc)[:200]) from exc
+    if not isinstance(arguments, dict):
+        raise ConfigError("--args must be a JSON object")
+    return api.invoke(args.tool, arguments, home=args.home)
+
+
+def cmd_runs(args: argparse.Namespace) -> dict[str, Any]:
+    from . import api
+
+    return api.invoke("kvflow_runs", {"project_id": args.project, "limit": args.limit},
+                      home=args.home)
+
+
+def cmd_result(args: argparse.Namespace) -> dict[str, Any]:
+    from . import api
+
+    return api.invoke("kvflow_result", {"job_id": args.job_id}, home=args.home)
+
+
+def cmd_tools(args: argparse.Namespace) -> dict[str, Any]:
+    from . import api
+
+    return {
+        "tools": [
+            {"name": spec["name"], "description": spec["description"],
+             "schema": spec["schema"]}
+            for spec in api.TOOLS
+        ],
+        "count": len(api.TOOLS),
+        "runtime": str(api.home_from(args.home)),
+    }
+
+
 def add_product_commands(extension) -> dict[str, Callable]:
     """Register the product command surface on the core parser.
 
@@ -337,6 +382,18 @@ def add_product_commands(extension) -> dict[str, Callable]:
     run.add_argument("--max-nodes", type=int, default=None)
     run.add_argument("--dry-run", action="store_true")
 
+    runs = add("runs", "recent workflow runs")
+    runs.add_argument("--project", dest="project", default=None)
+    runs.add_argument("--limit", type=int, default=25)
+
+    result = add("result", "the evidence of one finished run")
+    result.add_argument("job_id")
+
+    tools = add("tools", "the tool surface this runtime exposes to hosts")
+    bridge = add("bridge", "call one KVFlow tool with JSON arguments (host adapter)")
+    bridge.add_argument("--tool", required=True)
+    bridge.add_argument("--args", default="{}")
+
     return {
         "project.onboard": cmd_project_onboard,
         "project.show": cmd_project_show,
@@ -354,6 +411,10 @@ def add_product_commands(extension) -> dict[str, Callable]:
         }[getattr(args, "profile_command", None) or "list"](args),
         "plan": cmd_plan,
         "run": cmd_run,
+        "runs": cmd_runs,
+        "result": cmd_result,
+        "tools": cmd_tools,
+        "bridge": cmd_bridge,
     }
 
 

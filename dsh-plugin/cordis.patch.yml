@@ -1,0 +1,27 @@
+# KVFlow DSH bundle patch: one host row.
+#
+# The row name resolves from the profile's own node_modules, where
+# `dsh plugin --profile <name> add <this package>` installed it. `config` below
+# is the *default*; a profile may override any field in its own
+# cordis.patch.yml without editing this package:
+#
+#   - id: kvflow
+#     config:
+#       home: D:/kvflow-runtime
+#       python: C:/Python313/python.exe
+#       workspace: D:/work/my-project
+#
+# Disable the plugin for one profile without uninstalling it:
+#
+#   - id: kvflow
+#     disabled: true
+- insert:
+    - id: kvflow
+      name: kvflow-dsh
+      config:
+        # runtime directory that holds the registry, durable store and workspaces
+        home: null
+        # interpreter that can import the kvflow package
+        python: python
+        # leave null to resolve the current project from the DSH workspace
+        workspace: null
