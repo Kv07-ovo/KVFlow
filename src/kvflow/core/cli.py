@@ -55,6 +55,35 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+#: the one database every entrance opens
+DATABASE_NAME = "kvflow.sqlite3"
+#: the name this product used before it was genericised, migrated on first open
+LEGACY_DATABASE_NAME = "agent_os.sqlite3"
+
+
+def database_path(home: str | os.PathLike[str] | None) -> Path:
+    """The single authoritative database for a runtime home.
+
+    Every entrance - CLI, MCP server, host plugin, background runner - must resolve
+    the same file, or the product has two task states that disagree. A home written
+    by an earlier build is migrated in place rather than read as empty.
+    """
+    base = Path(home).expanduser().resolve() if home else Path.cwd() / DEFAULT_HOME
+    base.mkdir(parents=True, exist_ok=True)
+    canonical = base / DATABASE_NAME
+    legacy = base / LEGACY_DATABASE_NAME
+    if not canonical.exists() and legacy.exists():
+        try:
+            legacy.rename(canonical)
+            for suffix in ("-wal", "-shm"):
+                sidecar = base / f"{LEGACY_DATABASE_NAME}{suffix}"
+                if sidecar.exists():
+                    sidecar.rename(base / f"{DATABASE_NAME}{suffix}")
+        except OSError:  # pragma: no cover - a locked legacy file is reported by doctor
+            return legacy
+    return canonical
+
+
 def runtime_paths(home: str | os.PathLike[str] | None) -> dict[str, Path]:
     base = Path(home).expanduser().resolve() if home else Path.cwd() / DEFAULT_HOME
     base.mkdir(parents=True, exist_ok=True)
@@ -62,7 +91,7 @@ def runtime_paths(home: str | os.PathLike[str] | None) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     return {
         "home": base,
-        "database": base / "kvflow.sqlite3",
+        "database": database_path(base),
         "workspace": workspace,
         "backups": base / "backups",
         "registry": base / "processes.json",

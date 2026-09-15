@@ -181,7 +181,10 @@ def _resolve(home: Path, project_id: str) -> tuple[registry.ProjectConfig, Proje
 
 
 def _store_for(home: Path) -> Store:
-    store = Store(home / "agent_os.sqlite3")
+    """The one database every entrance opens (never a second, private state)."""
+    from .core import cli as core_cli
+
+    store = Store(core_cli.database_path(home))
     store.initialize()
     return store
 
@@ -708,6 +711,37 @@ def execute_run(
             run["integration"] = {"applied": [], "skipped": True,
                                   "reason": f"{type(exc).__name__}: {exc}"}
             run["problems"].append(f"integration refused: {type(exc).__name__}")
+    # ---- the program gate: a manager verdict cannot bypass it -----------------
+    # Only a coordinated run (one that registered contracts, requirements,
+    # invariants or submissions) is judged by the semantic layers; an ordinary run
+    # reports NOT_APPLICABLE rather than a fake PASS.
+    gate: dict[str, Any] | None = None
+    try:
+        from . import coordination
+
+        coordinator = coordination.SemanticCoordinator(store, project_id=project_id,
+                                                       job_id=job_id)
+        layers = coordination.integration_layers(
+            coordinator,
+            applied=list(run.get("integration", {}).get("applied") or []),
+            receipts_exit_zero=any(int(row["exit_code"]) == 0 for row in receipts),
+            node_states=run["node_states_final"],
+        )
+        run["integration_layers"] = layers
+        gate = coordinator.final_gate(
+            node_states=run["node_states_final"],
+            receipts_exit_zero=any(int(row["exit_code"]) == 0 for row in receipts),
+            required_artifacts=manifest.get("required_artifacts") or None,
+            integration=layers,
+        )
+        run["correctness_gate"] = gate
+        for name in gate["failed"]:
+            run["problems"].append(f"correctness gate failed: {name}")
+    except V1Error as exc:  # a gate that cannot be evaluated is reported, never skipped
+        run["correctness_gate"] = {"gate": "FINAL_MANAGER_GATE", "passed": None,
+                                   "error": f"{type(exc).__name__}: {exc}",
+                                   "failed": ["GATE_ERROR"]}
+        run["problems"].append("correctness gate could not be evaluated")
     _record_knowledge(store, project_id=project_id, job_id=job_id, run=run, receipts=receipts)
     run["budget"] = {"scopes": scope_ids, "job_usage": ledger.usage(scope_ids["job"])}
     run["source_not_modified"] = _source_intact(config, snapshot)
@@ -729,10 +763,14 @@ def execute_run(
         )
     if not integration_ok:
         run["problems"].append("nothing was integrated")
+    gate_ok = True if not run.get("correctness_gate") else bool(
+        run["correctness_gate"].get("passed"))
+    if not gate_ok:
+        run["problems"].append("the final correctness gate did not pass")
     run["status"] = (
         "PASS"
         if not run["problems"] and len(completed) == len(plan.nodes)
-        and review_ok and integration_ok
+        and review_ok and integration_ok and gate_ok
         else "PARTIAL"
     )
     run["ended_at"] = utcnow().isoformat()

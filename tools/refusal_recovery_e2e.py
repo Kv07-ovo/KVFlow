@@ -34,6 +34,7 @@ sys.path.insert(0, str(PRODUCT / "src"))
 
 from kvflow import registry  # noqa: E402
 from kvflow.core.budget import BudgetLedger  # noqa: E402
+from kvflow.core import cli as core_cli  # noqa: E402
 from kvflow.core.budget import Charge  # noqa: E402
 from kvflow.core.contracts import BudgetScope, NodeSpec, Plan, Role  # noqa: E402
 from kvflow.core.errors import V1Error  # noqa: E402
@@ -104,7 +105,7 @@ def budget_refusal(store: Store, project, receipt: dict) -> None:
 
     def scope(scope_id, kind, parent, calls, micro, *, job=None, seconds=3600):
         return BudgetScope(
-            scope_id=f"{scope_id}-{RUN_TAG}", scope_kind=kind, parent_scope_id=parent,
+            scope_id=scope_id, scope_kind=kind, parent_scope_id=parent,
             project_id=(None if kind == "GLOBAL" else project.id),
             job_id=(None if kind != "JOB" else job), calls=calls, input_tokens=1_000_000,
             output_tokens=200_000, tool_calls=calls, storage_bytes=1 << 20,
@@ -112,12 +113,13 @@ def budget_refusal(store: Store, project, receipt: dict) -> None:
             deadline=now + timedelta(hours=2), authorization_digest=digest,
         )
 
-    ledger.register_scope(scope("global-refusal-proof", "GLOBAL", None, 100, 5_000_000))
-    ledger.register_scope(scope("project-refusal-proof", "PROJECT",
+    ledger.register_scope(scope(f"global-refusal-proof-{RUN_TAG}", "GLOBAL", None, 100,
+                                5_000_000))
+    ledger.register_scope(scope(f"project-refusal-proof-{RUN_TAG}", "PROJECT",
                                 f"global-refusal-proof-{RUN_TAG}", 100, 5_000_000))
     job_id = store.create_job(project.id, "budget refusal", AUTH)
     # a deliberately impossible job cap: one micro-CNY cannot cover a single call
-    job_scope = "job-refusal-proof"
+    job_scope = f"job-refusal-proof-{RUN_TAG}"
     ledger.register_scope(scope(job_scope, "JOB", f"project-refusal-proof-{RUN_TAG}", 1, 1,
                                 job=job_id))
     request = {
@@ -134,7 +136,7 @@ def budget_refusal(store: Store, project, receipt: dict) -> None:
     except V1Error as exc:
         receipt["budget_refusal"] = {
             "refused": True, "code": getattr(exc, "code", None), "error": str(exc),
-            "job_scope": job_scope, "job_budget_micro_cny": ledger.scope(f"{job_scope}-{RUN_TAG}").micro_cny,
+            "job_scope": job_scope, "job_budget_micro_cny": ledger.scope(job_scope).micro_cny,
         }
     else:
         receipt["budget_refusal"] = {"refused": False, "admission": str(admission)}
@@ -142,7 +144,7 @@ def budget_refusal(store: Store, project, receipt: dict) -> None:
     # the same ledger does admit a request that fits, so the refusal is a boundary
     # and not a broken ledger
     fits_job = store.create_job(project.id, "budget within cap", AUTH)
-    fits = "job-refusal-fits"
+    fits = f"job-refusal-fits-{RUN_TAG}"
     ledger.register_scope(scope(fits, "JOB", f"project-refusal-proof-{RUN_TAG}", 5,
                                 2_000_000, job=fits_job))
     admission = ledger.reserve(ReservationRequest(**_request({
@@ -155,6 +157,12 @@ def budget_refusal(store: Store, project, receipt: dict) -> None:
     receipt["budget_refusal"]["a_fitting_request_is_admitted"] = bool(
         admission.reservation_id
     )
+    # the proof never executed the call, so the slot it reserved is released: a
+    # reservation that is neither settled nor released is a capacity leak, and the
+    # ledger refuses later requests because of it
+    ledger.release_never_started(admission.reservation_id,
+                                 evidence="acceptance proof: the effect was never executed")
+    receipt["budget_refusal"]["slot_released"] = True
 
 
 def _request(payload: dict) -> dict:
@@ -240,7 +248,16 @@ def recovery_proof(store: Store, project, receipt: dict) -> None:
 
 
 def main() -> int:
+    # this proof asserts refusal boundaries, so it starts from an empty ledger: a
+    # scope left over from an earlier run would make "capacity" the thing under test
+    # instead of the boundary. (Durability across restarts is proven separately, by
+    # the semantic E2E's restart scenario.)
     HOME.mkdir(parents=True, exist_ok=True)
+    database = core_cli.database_path(HOME)
+    for suffix in ("", "-wal", "-shm"):
+        stale = database.with_name(database.name + suffix)
+        if stale.exists():
+            stale.unlink()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
     store = Store(HOME / "kvflow.sqlite3")

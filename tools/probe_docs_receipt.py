@@ -11,7 +11,7 @@ PRODUCT = Path(r"C:\Users\90428\Desktop\KVStock-restored\kvflow")
 sys.path.insert(0, str(PRODUCT / "src"))
 
 HOME = PRODUCT / ".runtime" / "cross-project" / "home"
-con = sqlite3.connect(str(HOME / "agent_os.sqlite3"))
+con = sqlite3.connect(str(HOME / "kvflow.sqlite3"))
 con.row_factory = sqlite3.Row
 print("-- receipts --")
 for row in con.execute(

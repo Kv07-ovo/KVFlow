@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from kvflow import registry, workflow
+from kvflow.core import cli as core_cli
 from kvflow.core.contracts import NodeSpec, Plan, Role
 from kvflow.core.manager import Manager
 from kvflow.core.providers import Completion, ProviderIdentity, ToolCall
@@ -94,7 +95,7 @@ def _manager(verdicts: list[str]) -> Manager:
 
 
 def build(tmp_path: Path):
-    store = Store(tmp_path / "agent_os.sqlite3")
+    store = Store(core_cli.database_path(tmp_path))
     store.initialize()
     source = tmp_path / "rework-source"
     (source / "src").mkdir(parents=True, exist_ok=True)

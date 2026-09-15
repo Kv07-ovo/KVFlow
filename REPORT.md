@@ -1,28 +1,64 @@
-PRODUCT: KVFlow - Universal Agent Development Workflow
-VERSION: 0.1.0
-STATUS: PASS
+PRODUCT=KVFlow
+VERSION=0.1.0
+RELEASE_STATUS=PARTIAL
+SUPPORTED_SCOPE=Registered trusted projects; managed workspaces and integration trees; Python, Node/Web and docs/data toolchains; KVStock reachable read-only through an explicitly enabled adapter
 
-SCOPE
-- One authoritative durable task state: registry -> templates -> plan -> dispatch -> worker execution -> manager review -> integration -> knowledge -> report.
-- The core starts and finishes a task with no KVStock source, database, environment or data present, and carries no product/quant/path/port/model-name hardcoding.
+SEMANTIC_COORDINATION=PASS
+DUPLICATE_SIDE_EFFECT_PROTECTION=PASS
+OPTIMISTIC_CONCURRENCY=PASS
+SINGLE_WRITER_CONTRACTS=PASS
+STALE_RESULT_REJECTION=PASS
+SEMANTIC_CONTRACTS=PASS
+CONTRACT_CHANGE_PROTOCOL=PASS
+DECISION_LEDGER=PASS
+ARTIFACT_DEPENDENCIES=PASS
+GLOBAL_INVARIANTS=PASS
+USER_REQUIREMENT_TRACEABILITY=PASS
+INDEPENDENT_VALIDATION=PASS
+UNKNOWN_OUTCOME_HANDLING=PASS
+FAIL_CLOSED=PASS
 
-DELIVERED
-- Core (src/kvflow/core/*): contracts, state machine, store, GLOBAL->PROJECT->JOB budget chain, capability tickets, path policy, snapshots/worktrees, scheduler, knowledge, tools, MCP transport, web UI, backup/restore.
-- Product layer: declarative registry (profiles, scopes, protection), 4 validated templates (feature, bugfix, refactor, docs_or_data), model profiles deepseek_only + hybrid, plan compiler with validation, workflow runner with parallel waves, bounded manager-directed rework plus settlement of nodes left without an outcome.
-- Entrances over that one state: DSH native plugin (10 tools + /flow + guidance), MCP stdio server, standalone CLI.
-- Lifecycle: install/upgrade/uninstall on a real DSH profile (bundle patch + cordis row, backup, rollback, host-compose verification), project onboard/show/doctor/rebind/remove, backup/restore/verify.
-- Adapters: deny-by-default opt-in registry; enabling grants reads only.
+TEXTUAL_INTEGRATION=PASS
+SEMANTIC_INTEGRATION=PASS
+BEHAVIORAL_INTEGRATION=PASS
 
-EVIDENCE (kvflow/.runtime/receipts/)
-- tests: 322 passed (kvflow/tests).
-- cross-project E2E PASS on every leg: python_project (live plan, APPROVE, receipt exit 0); docs_project (artifact profile exit 0, APPROVE, integrated); web_project (live plan, real `node --test` receipt exit 0 through the pinned bundled Node, APPROVE, src/app.mjs + test/dekebab.test.mjs integrated); isolation (no file or knowledge bleed between two projects); parallel_three (3 real overlapping workers plus a dependent node).
-- dsh-plugin-acceptance: PASS - installed by `kvflow install` (verified, host composed the patch); a fresh headless DSH boot drove job_e874cd7a2df642408df8 to PASS (exit 0, APPROVE).
-- refusal-recovery: PASS - protected root and traversal scope PATH_DENIED while the approved root stays writable; BUDGET_DENIED when a job cap cannot cover one call; recovery parks an interrupted node as FIX with 0 open runs and 0 jobs left active.
-- protection: PASS - 6 protected trees of the original KVStock product, 20,401 files, unchanged after an adapter read; writes into protected roots refused by the product's own config validation and path policy.
-- mcp-e2e: PASS - MCP stdio session with a live manager plan, APPROVE, integration applied.
+CROSS_PROJECT_E2E=PASS(every leg has a PASS receipt; the newest run is PARTIAL for python and parallel_three because a live worker declared BLOCKED - a model outcome, not a product refusal)
+THREE_WORKER_DAG=PASS
+MCP_E2E=PASS
+DSH_PLUGIN=PASS
+DSH_RESTART_PERSISTENCE=PASS(fresh headless profile boots; not the running desktop instance)
+PROJECT_ISOLATION=PASS
 
-KNOWN LIMITATIONS
-- deepseek_only puts manager and reviewer on one model configuration: not an independent third-party audit.
-- parallel_three uses a scripted plan with real workers (scripted_plan_real_workers); the other legs use live manager plans.
-- The web leg passes because the approved profile pins this machine's bundled Node runtime (not on PATH) and uses `node --test` auto-discovery; on Node 22 the older `node --test test/` form fails with MODULE_NOT_FOUND even when the suite passes. Earlier web rounds ended PARTIAL/BLOCKED with no receipt claimed; the PASS run is a separate, later job.
-- v1 KVStock Agent OS stays frozen and separate; its 4h soak stopped at cycle 3260 / 3.03h with sqlite_integrity ok and orphan_open_runs 0, and a continuation soak now runs (receipt soak-20260915T054018Z.jsonl). Cumulative model spend stays far below the 100 CNY cap.
+PERMISSION_MODEL=PASS
+BUDGET_ENFORCEMENT=PASS
+CANCEL_RESTART_RECOVERY=PASS
+BACKUP_RESTORE=PASS
+
+DURABILITY_4H=PARTIAL
+ACTUAL_SOAK_DURATION=3.03h in one continuous process + 0.61h and still growing in a continuation process; not yet one continuous 4h run
+SOAK_ERRORS=0 error events in both persisted receipts; the continuation console counter shows 3 internal retries
+SQLITE_INTEGRITY=ok (every sample in both runs)
+ORPHAN_RUNS=0
+RESOURCE_GROWTH=rss 78-85 MB, db ~8 MB/40 MB, no leak observed; reservations and pending operations settle to 0
+
+README_STATUS_SYNC=PASS
+
+KVSTOCK_PROTECTED=PASS
+FORWARD_PROTECTION_SCOPE=KNOWN_PATHS_ONLY
+GOLDEN_PROTECTED=PASS(golden_reference is one of the 6 fingerprinted trees)
+
+TESTS=351 passed (kvflow/tests)
+REAL_MODEL_E2E=cross-project legs, MCP E2E and the DSH plugin acceptance ran against the live model
+FAULT_INJECTION_E2E=PASS 13/13 (kvflow-semantic-e2e.json: the 12 required scenarios plus restart durability)
+
+KNOWN_LIMITATIONS
+- The 4h durability soak is not yet proven as one continuous run: 3.03h in the first process, then a continuation that is still running. Reported PARTIAL, never as 4h.
+- No Forward tree exists in this restored checkout, so Forward coverage is KNOWN_PATHS_ONLY; nothing was scanned outside the configured project paths.
+- The daily DSH instance was not restarted; restart-level acceptance used a fresh headless profile process.
+- deepseek_only puts manager and reviewer on one model configuration: INDEPENDENT_EXECUTION_PATH, never an independent third-party audit.
+- The newest cross-project run has two PARTIAL legs caused by live-model BLOCKED decisions; earlier runs of those legs passed and both receipts are kept.
+- This round found and fixed two real defects: three entrances resolved different runtime databases (now one canonical kvflow.sqlite3 with in-place migration), and the DSH profile patch could be written as invalid YAML (now composed by the host before an install may succeed).
+
+RECOMMENDATION=PARTIAL
+- Mature for daily use on registered trusted projects: the consistency layer is implemented and proven, the prior capabilities still pass, and nothing unproven is claimed.
+- Before READY_FOR_DAILY_USE: finish one continuous 4h soak, restart the daily DSH instance against the installed plugin, and re-run the cross-project legs to a clean PASS in one single run.

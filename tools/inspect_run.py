@@ -20,7 +20,7 @@ print("node states ", json.dumps(status["nodes"]))
 print("receipts    ", json.dumps(status["receipts"]))
 print("plan        ", json.dumps({k: status.get(k) for k in ("template", "model_profile", "plan_source")}))
 
-con = sqlite3.connect(str(home / "agent_os.sqlite3"))
+con = sqlite3.connect(str(home / "kvflow.sqlite3"))
 con.row_factory = sqlite3.Row
 print("-- operations --")
 for row in con.execute(

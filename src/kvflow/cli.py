@@ -430,6 +430,39 @@ def cmd_result(args: argparse.Namespace) -> dict[str, Any]:
     return api.invoke("kvflow_result", {"job_id": args.job_id}, home=args.home)
 
 
+def cmd_coordinate_show(args: argparse.Namespace) -> dict[str, Any]:
+    """What semantic state exists, and what is blocking it."""
+    from . import api
+
+    return api.invoke("kvflow_coordination",
+                      {"project_id": args.project_id, "job_id": args.job_id},
+                      home=args.home)
+
+
+def cmd_coordinate_gate(args: argparse.Namespace) -> dict[str, Any]:
+    """The final gate for one job's current node states, as the program sees it."""
+    from . import api, workflow
+    from .core.store import Store
+
+    home = _home(args)
+    payload = api.invoke("kvflow_coordination",
+                         {"project_id": args.project_id, "job_id": args.job_id},
+                         home=args.home)
+    node_states: dict[str, str] = {}
+    if args.job_id:
+        store = Store(core_cli.database_path(home))
+        store.initialize()
+        from .core.scheduler import Scheduler
+
+        node_states = {key: value.value
+                       for key, value in Scheduler(store).node_states(args.job_id).items()}
+    return {"project_id": args.project_id, "job_id": args.job_id,
+            "node_states": node_states, "coordination": payload,
+            "note": ("a failing check here cannot be overridden by a manager verdict;"
+                     " only a re-run, a rebase or a compatibility confirmation with"
+                     " evidence can clear it")}
+
+
 def cmd_tools(args: argparse.Namespace) -> dict[str, Any]:
     from . import api
 
@@ -566,6 +599,15 @@ def add_product_commands(extension) -> dict[str, Callable]:
     result = add("result", "the evidence of one finished run")
     result.add_argument("job_id")
 
+    coordinate = add("coordinate", "semantic coordination state and the final gate")
+    coordinate_sub = coordinate.add_subparsers(dest="coordinate_command")
+    coordinate_show = coordinate_sub.add_parser("show")
+    coordinate_show.add_argument("--project", dest="project_id", required=True)
+    coordinate_show.add_argument("--job", dest="job_id", default=None)
+    coordinate_gate = coordinate_sub.add_parser("gate")
+    coordinate_gate.add_argument("--project", dest="project_id", required=True)
+    coordinate_gate.add_argument("--job", dest="job_id", default=None)
+
     tools = add("tools", "the tool surface this runtime exposes to hosts")
     bridge = add("bridge", "call one KVFlow tool with JSON arguments (host adapter)")
     bridge.add_argument("--tool", required=True)
@@ -604,6 +646,10 @@ def add_product_commands(extension) -> dict[str, Callable]:
         "run": cmd_run,
         "runs": cmd_runs,
         "result": cmd_result,
+        "coordinate": lambda args: {
+            "show": cmd_coordinate_show,
+            "gate": cmd_coordinate_gate,
+        }[getattr(args, "coordinate_command", None) or "show"](args),
         "tools": cmd_tools,
         "bridge": cmd_bridge,
     }

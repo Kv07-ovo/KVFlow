@@ -26,6 +26,16 @@ from .core.errors import NotFoundError, V1Error
 HOME_ENV = "KVFLOW_HOME"
 
 
+def _store(home: Path):
+    """The single authoritative store for a runtime home."""
+    from .core import cli as core_cli
+    from .core.store import Store
+
+    store = Store(core_cli.database_path(home))
+    store.initialize()
+    return store
+
+
 def home_from(explicit: str | None = None) -> Path:
     value = explicit or os.environ.get(HOME_ENV)
     if not value:
@@ -69,7 +79,7 @@ def projects(home: Path, arguments: dict) -> dict:
 
 
 def project_for_path(home: Path, arguments: dict) -> dict:
-    """Resolve a directory to a registered project — how a host binds "current project"."""
+    """Resolve a directory to a registered project 鈥?how a host binds "current project"."""
     raw = str(arguments.get("path", "")).strip()
     if not raw:
         raise V1Error("a path is required", argument="path")
@@ -189,8 +199,7 @@ def knowledge(home: Path, arguments: dict) -> dict:
     project_id = str(arguments.get("project_id", ""))
     if not project_id:
         raise V1Error("a project_id is required", argument="project_id")
-    store = Store(home / "agent_os.sqlite3")
-    store.initialize()
+    store = _store(home)
     records = KnowledgeService(store).search(
         KnowledgeQuery(project_id=project_id, topic=arguments.get("topic"),
                        limit=int(arguments.get("limit", 25)))
@@ -212,7 +221,65 @@ def knowledge(home: Path, arguments: dict) -> dict:
 
 
 #: the tool table every entrance shares: name -> (handler, description, schema)
+def coordination(home: Path, arguments: dict) -> dict:
+    """The semantic state of one project (and its final correctness gate).
+
+    A host asks this the way a user would ask "why is this run not done yet": the
+    answer is which contract versions exist, which decisions are active, whether any
+    result went stale, and which gate check is blocking.
+    """
+    from . import coordination as semantic
+    from .core.store import Store
+
+    project_id = str(arguments.get("project_id", ""))
+    if not project_id:
+        raise V1Error("a project_id is required", argument="project_id")
+    store = _store(home)
+    coordinator = semantic.SemanticCoordinator(
+        store, project_id=project_id, job_id=arguments.get("job_id"))
+    payload: dict[str, Any] = {
+        "project_id": project_id,
+        "job_id": arguments.get("job_id"),
+        "contracts": coordinator.contracts(),
+        "decisions": coordinator.active_decisions(),
+        "decision_set_hash": coordinator.decision_set_hash(),
+        "artifacts": coordinator.artifacts(),
+        "operations": coordinator.operations(),
+        "requirements": coordinator.requirement_status(node_states={}),
+        "invariants": coordinator.invariant_status(),
+        "validations": coordinator.validation_status(),
+        "stale_submissions": coordinator.stale_submissions(),
+        "change_requests": coordinator.change_requests(),
+    }
+    if arguments.get("node_states"):
+        payload["gate"] = coordinator.final_gate(
+            node_states=dict(arguments["node_states"]),
+            required_artifacts=arguments.get("required_artifacts") or None,
+        )
+    return payload
+
+
 TOOLS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "kvflow_coordination",
+        "description": (
+            "The semantic coordination state of one project: contract versions, active"
+            " decisions, artifact versions, requirement traceability, global invariants,"
+            " stale results, unknown side effects, and - when node states are supplied -"
+            " the final correctness gate that outranks a manager's approval."
+        ),
+        "handler": coordination,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "job_id": {"type": "string"},
+                "node_states": {"type": "object"},
+                "required_artifacts": {"type": "object"},
+            },
+            "required": ["project_id"],
+        },
+    },
     {
         "name": "kvflow_projects",
         "description": "List the registered KVFlow projects, with registry health.",

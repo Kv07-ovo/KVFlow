@@ -37,6 +37,7 @@ PRODUCT = Path(r"C:\Users\90428\Desktop\KVStock-restored\kvflow")
 sys.path.insert(0, str(PRODUCT / "src"))
 
 from kvflow import model_profiles, planner, registry, templates, workflow  # noqa: E402
+from kvflow.core import cli as core_cli  # noqa: E402
 from kvflow.core.budget import BudgetLedger  # noqa: E402
 from kvflow.core.contracts import NodeSpec, Plan, Role  # noqa: E402
 from kvflow.core.errors import V1Error  # noqa: E402
@@ -456,7 +457,7 @@ def main() -> int:
     shutil.rmtree(ROOT, ignore_errors=True)
     paths = build_projects()
     HOME.mkdir(parents=True, exist_ok=True)
-    store = Store(HOME / "agent_os.sqlite3")
+    store = Store(core_cli.database_path(HOME))
     store.initialize()
 
     from kvflow.registry import ProfileSpec
