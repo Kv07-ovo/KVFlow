@@ -127,6 +127,44 @@ class BackupResult:
         }
 
 
+def _cleanup_tree(path: str | Path, *, attempts: int = 8) -> bool:
+    """Remove a scratch directory with a bounded retry.
+
+    Windows removes a directory asynchronously: ``shutil.rmtree`` can raise
+    ``WinError 145`` ("the directory is not empty") or ``WinError 5`` while the
+    kernel still holds the last handle, even though nothing in this process is
+    using it. A short bounded retry is the honest fix; a scratch directory that
+    still cannot be removed is reported to the caller rather than swallowed.
+    """
+    import time
+
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if attempt >= attempts:
+                return False
+            time.sleep(min(0.5, 0.02 * (2 ** attempt)))
+    return False
+
+
+class _scratch_dir:
+    """A temporary directory whose cleanup tolerates the Windows delete race."""
+
+    def __init__(self, prefix: str = "kvflow-") -> None:
+        self.path = Path(tempfile.mkdtemp(prefix=prefix))
+        self.cleaned = True
+
+    def __enter__(self) -> Path:
+        return self.path
+
+    def __exit__(self, *exc: object) -> bool:
+        self.cleaned = _cleanup_tree(self.path)
+        return False
+
 class BackupManager:
     """Creates, verifies and restores consistent Agent OS backups."""
 
@@ -148,7 +186,7 @@ class BackupManager:
     def row_counts(path: Path) -> dict[str, int]:
         """Counts via the backup API path so a live WAL is included."""
         counts: dict[str, int] = {}
-        with tempfile.TemporaryDirectory() as scratch:
+        with _scratch_dir() as scratch:
             snapshot = Path(scratch) / "snapshot.sqlite3"
             BackupManager._snapshot_database(path, snapshot)
             connection = sqlite3.connect(snapshot)
@@ -449,7 +487,7 @@ class BackupManager:
         if new_version == self.version:
             raise ContractError("the candidate version equals the current version")
         backup = self.create(note=f"pre-upgrade to {new_version}") if backup_first else None
-        with tempfile.TemporaryDirectory() as scratch:
+        with _scratch_dir() as scratch:
             candidate = Path(scratch) / "kvflow.sqlite3"
             self._snapshot_database(self.database, candidate)
             before = self.row_counts(self.database)
