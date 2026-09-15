@@ -198,19 +198,27 @@ def read_patch(profile_dir: Path) -> str:
 
 
 def plugin_config(home: Path, python: Path, python_path: Path | None,
-                  workspace: Path | None) -> dict[str, Any]:
-    """The config row the plugin reads, as YAML-safe plain scalars."""
+                  workspace: Path | None, credentials: Path | None = None) -> dict[str, Any]:
+    """The config row the plugin reads, as YAML-safe plain scalars.
+
+    ``credentials`` is the read-only pointer to the host's credential store. The
+    desktop host does not export DEEPSEEK_API_KEY to the children it spawns, so
+    without this pointer the plugin's KVFlow child has no provider credential and
+    every workflow is refused with AuthorityDenied - the value is a path, never a
+    secret, and KVFlow reads it exactly the way it reads KVFLOW_CREDENTIALS.
+    """
     return {
         "home": str(home).replace("\\", "/"),
         "python": str(python).replace("\\", "/"),
         "pythonPath": (str(python_path).replace("\\", "/") if python_path else None),
         "workspace": (str(workspace).replace("\\", "/") if workspace else None),
+        "credentials": (str(credentials).replace("\\", "/") if credentials else None),
     }
 
 
 def _render_row(config: Mapping[str, Any]) -> str:
     lines = [f"- id: {PLUGIN_ID}", "  config:"]
-    for key in ("home", "python", "pythonPath", "workspace"):
+    for key in ("home", "python", "pythonPath", "workspace", "credentials"):
         value = config.get(key)
         if value is None:
             lines.append(f"    {key}: null")
@@ -459,12 +467,12 @@ def restore_backup(backup: Path, profile_dir: Path) -> dict[str, Any]:
 
 
 def plan(profile: str | None, *, home: Path, python: Path, python_path: Path | None,
-         workspace: Path | None) -> dict[str, Any]:
+         workspace: Path | None, credentials: Path | None = None) -> dict[str, Any]:
     """Exactly what an install would write, without writing it."""
     name, directory = resolve_profile(profile)
     document = read_profile(directory)
     patch = read_patch(directory)
-    config = plugin_config(home, python, python_path, workspace)
+    config = plugin_config(home, python, python_path, workspace, credentials)
     return {
         "profile": name,
         "profile_dir": str(directory),
@@ -486,6 +494,7 @@ def install(
     python_path: Path | None,
     workspace: Path | None,
     version: str,
+    credentials: Path | None = None,
     upgrade: bool = False,
     dry_run: bool = False,
     timeout: int = INSTALL_TIMEOUT_SECONDS,
@@ -497,7 +506,7 @@ def install(
     if not isinstance(manifest.get("dsh"), Mapping) or "bundle" not in manifest["dsh"]:
         raise ContractError("the plugin package does not declare a dsh.bundle patch")
     python_report = verify(python, home=home)
-    config = plugin_config(home, python, python_path, workspace)
+    config = plugin_config(home, python, python_path, workspace, credentials)
     before = read_profile(directory)
     already = (
         PLUGIN_PACKAGE in (before.get("dependencies") or {})
@@ -515,7 +524,7 @@ def install(
             "upgrade": upgrade,
             "already_installed": already,
             "plan": plan(name, home=home, python=python, python_path=python_path,
-                         workspace=workspace),
+                         workspace=workspace, credentials=credentials),
             "python_check": python_report,
         }
 

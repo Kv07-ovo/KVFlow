@@ -47,6 +47,11 @@ function configOf(config) {
     // into the interpreter itself (a source checkout, a bundled runtime)
     pythonPath: config?.pythonPath || process.env.KVFLOW_PYTHONPATH || null,
     workspace: config?.workspace || null,
+    // A read-only pointer to the host's credential store. The desktop host does
+    // not export DEEPSEEK_API_KEY to the processes it spawns, so without this the
+    // KVFlow child has no provider credential and every workflow is refused with
+    // AuthorityDenied. KVFlow reads the file itself; the value is a path.
+    credentials: config?.credentials || process.env.KVFLOW_CREDENTIALS || null,
     timeoutMs: Number(config?.timeoutMs || DEFAULT_TIMEOUT_MS),
   };
 }
@@ -87,6 +92,11 @@ function bridge(config, tool, args) {
       env.PYTHONPATH = [String(settings.pythonPath), env.PYTHONPATH || '']
         .filter(Boolean)
         .join(delimiter);
+    }
+    if (settings.credentials) {
+      // the child reads this path itself; the pointer is never a secret and never
+      // travels further than this one process
+      env.KVFLOW_CREDENTIALS = String(settings.credentials);
     }
     env.PYTHONIOENCODING = 'utf-8';
     execFile(

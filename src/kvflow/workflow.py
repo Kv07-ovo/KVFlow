@@ -73,11 +73,41 @@ def run_manifest(home: str | Path, job_id: str) -> dict:
 
 
 def _write_manifest(home: str | Path, job_id: str, payload: dict) -> None:
+    """Write a run manifest atomically, even when two writers race for it.
+
+    Two entrances legitimately write the same manifest: the host plugin records the
+    launched run while the runner records its outcome. A single fixed temp name made
+    the loser of that race fail with ``[WinError 5] access denied`` on Windows, so
+    each writer now uses its own temp name and the replace is retried a bounded
+    number of times for a transient sharing violation. A real failure after the last
+    attempt is raised, never swallowed.
+    """
+    import os
+    import threading
+    import time as _time
+
     path = runs_dir(home) / f"{job_id}.json"
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
-                         encoding="utf-8")
-    temporary.replace(path)
+    body = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
+    temporary = path.with_suffix(
+        f".json.{os.getpid()}.{threading.get_ident() % 100000}.tmp"
+    )
+    temporary.write_text(body, encoding="utf-8")
+    last: OSError | None = None
+    for attempt in range(1, 6):
+        try:
+            temporary.replace(path)
+            return
+        except OSError as exc:  # a sharing violation is transient on Windows
+            last = exc
+            if getattr(exc, "winerror", None) not in (5, 32, 145) and attempt >= 3:
+                break
+            _time.sleep(min(0.8, 0.05 * (2 ** attempt)))
+    try:
+        temporary.unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - best effort
+        pass
+    if last is not None:
+        raise last
 
 
 def update_manifest(home: str | Path, job_id: str, **fields: Any) -> dict:

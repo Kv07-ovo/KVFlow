@@ -328,9 +328,10 @@ def cmd_install(args: argparse.Namespace) -> dict[str, Any]:
     python_path = Path(args.python_path).resolve() if args.python_path else Path(
         __file__).resolve().parents[1]
     workspace = Path(args.workspace).resolve() if args.workspace else None
+    credentials = Path(args.credentials).resolve() if args.credentials else None
     return host_install.install(
         profile=args.profile, home=home, python=python, python_path=python_path,
-        workspace=workspace, version=_version(),
+        workspace=workspace, credentials=credentials, version=_version(),
         upgrade=bool(getattr(args, "upgrade", False)) or args.command == "upgrade",
         dry_run=bool(args.dry_run),
     )
@@ -561,12 +562,16 @@ def add_product_commands(extension) -> dict[str, Callable]:
                              help="the import root for that interpreter")
     install_cmd.add_argument("--workspace", default=None,
                              help="default workspace directory for the host tools")
+    install_cmd.add_argument("--credentials", default=None,
+                             help="read-only path to the host credential store"
+                                  " (recorded as a pointer, never a secret)")
     install_cmd.add_argument("--dry-run", action="store_true")
     upgrade_cmd = add("upgrade", "re-install the plugin after the checkout changed")
     upgrade_cmd.add_argument("--profile", default=None)
     upgrade_cmd.add_argument("--python", default=None)
     upgrade_cmd.add_argument("--python-path", default=None)
     upgrade_cmd.add_argument("--workspace", default=None)
+    upgrade_cmd.add_argument("--credentials", default=None)
     upgrade_cmd.add_argument("--dry-run", action="store_true")
     uninstall_cmd = add("uninstall", "detach the plugin, restoring the profile files")
     uninstall_cmd.add_argument("--profile", default=None)
