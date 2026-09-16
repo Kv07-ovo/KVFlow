@@ -1,0 +1,1 @@
+﻿Call the tool `kvflow_start` exactly once, with exactly these arguments: requirement="add a pure function add_one(x) to src/calc.py that returns x + 1, and add a test for it in tests/test_calc.py (do not change any other behaviour)", project_id="dsh-daily-test", template="feature". Do not call any other tool. Then print the job_id and nothing else.
