@@ -577,6 +577,48 @@ class Store:
             )
         return project.id
 
+    def amend_project(self, project: Project, *, actor: str = "user") -> dict:
+        """Replace a project's approved configuration with a newly approved one.
+
+        ``register_project`` is immutable on purpose: a run may never widen its own
+        scope. But the *user* can approve a new configuration - a project that gains a
+        test profile, or changes its write roots - and without an explicit amend the
+        durable row keeps the old authorization, so every later run reports drift and
+        silently executes against the stale scope. This is that explicit path: it
+        records the previous digest, the new digest and who did it.
+        """
+        if not project.trusted:
+            raise AuthorizationError("untrusted project cannot be registered")
+        digest = content_digest(project)
+        with self.tx() as conn:
+            existing = conn.execute(
+                "SELECT digest, authorization_digest FROM projects WHERE project_id = ?",
+                (project.id,),
+            ).fetchone()
+            if existing is None:
+                raise NotFoundError("no such project to amend", project_id=project.id)
+            previous = str(existing["authorization_digest"])
+            # the authorization digest *is* the identity of what the user approved, so
+            # an amend presenting the same authorization changes nothing; the row's own
+            # document digest also carries a registration timestamp, which must not be
+            # mistaken for a new approval
+            if previous == project.authorization_digest:
+                return {"project_id": project.id, "changed": False,
+                        "authorization_digest": previous}
+            conn.execute(
+                "UPDATE projects SET document = ?, digest = ?, authorization_digest = ?,"
+                " source_root = ?, managed_root = ?, registered_at = ?"
+                " WHERE project_id = ?",
+                (
+                    canonical_json(project), digest, project.authorization_digest,
+                    project.source_root, project.managed_root,
+                    project.registered_at.isoformat(), project.id,
+                ),
+            )
+        return {"project_id": project.id, "changed": True,
+                "previous_authorization_digest": previous,
+                "authorization_digest": project.authorization_digest}
+
     def project(self, project_id: str) -> Project:
         with self.read() as conn:
             row = conn.execute(

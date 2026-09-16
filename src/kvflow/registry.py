@@ -38,7 +38,7 @@ from .core.contracts import (
     Text,
     content_digest,
 )
-from .core.errors import AuthorizationError, ConfigError, ConflictError, NotFoundError
+from .core.errors import AuthorizationError, ConfigError, ConflictError, NotFoundError, V1Error
 from .core.store import Store
 
 CONFIG_DIR = ".kvflow"
@@ -519,9 +519,22 @@ class Registry:
         }
         payload["projects"][config.project_id] = entry
         self._write(payload)
+        amended: dict | None = None
         if store is not None:
-            store.register_project(project)
-        return {"entry": entry, "project": json.loads(project.model_dump_json())}
+            # A re-approved configuration must reach the durable row too. The store
+            # refuses an implicit re-registration (a run may never widen its own
+            # scope), so an existing project is amended explicitly and the previous
+            # authorization digest is recorded in the index.
+            try:
+                store.register_project(project)
+            except V1Error:
+                amended = store.amend_project(project)
+                entry["amended_from"] = amended.get("previous_authorization_digest")
+                entry["amended_at"] = datetime.now(timezone.utc).isoformat()
+                payload["projects"][config.project_id] = entry
+                self._write(payload)
+        return {"entry": entry, "project": json.loads(project.model_dump_json()),
+                "amended": amended}
 
     def list(self) -> list[dict]:
         payload = self._read()
