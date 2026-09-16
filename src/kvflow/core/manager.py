@@ -331,8 +331,15 @@ class Manager:
         diff: Mapping[str, Any],
         receipts: Sequence[Mapping[str, Any]],
         content_digest: str,
+        worker_reports: Sequence[Mapping[str, Any]] | None = None,
     ) -> ManagerVerdict:
-        """Ask for a verdict, then enforce the evidence rules on the answer."""
+        """Ask for a verdict, then enforce the evidence rules on the answer.
+
+        The packet carries what the reviewer needs to judge the *work*, not only its
+        side effects: receipts with their real test counts and output digests (a bare
+        exit code cannot be told apart from a repeated run), and the workers' own
+        result text, which is the entire deliverable of a read-only task.
+        """
         evidence = {
             "objective": objective,
             "acceptance_criteria": list(acceptance),
@@ -354,10 +361,28 @@ class Manager:
                     "receipt_id": r.get("receipt_id"),
                     "profile_id": r.get("profile_id"),
                     "exit_code": r.get("exit_code"),
+                    "runner": r.get("runner"),
                     "reported_tests": r.get("reported_tests"),
-                    "stdout_sha256": r.get("stdout_sha256"),
+                    # a store row names the digest stdout_digest, an already shaped
+                    # receipt names it stdout_sha256: accept either, never drop it
+                    "stdout_sha256": r.get("stdout_sha256") or r.get("stdout_digest"),
+                    "stderr_sha256": r.get("stderr_digest"),
+                    "stdout_bytes": r.get("stdout_bytes"),
+                    "stderr_bytes": r.get("stderr_bytes"),
+                    "duration_ms": r.get("duration_ms"),
                 }
                 for r in receipts
+            ],
+            "worker_reports": [
+                {
+                    "node_id": report.get("node_id"),
+                    "status": report.get("status"),
+                    "summary": report.get("summary"),
+                    "steps": report.get("steps"),
+                    "tool_calls": report.get("tool_calls"),
+                    "notes": list(report.get("notes") or [])[:6],
+                }
+                for report in (worker_reports or [])
             ],
         }
         prompt = (

@@ -620,6 +620,9 @@ def execute_run(
                 verdict = manager.review(
                     objective=plan.objective, acceptance=list(plan.acceptance), diff=diff,
                     receipts=receipts, content_digest=diff.get("content_digest") or "",
+                    # the workers' own result text travels with the receipts: for a
+                    # read-only task it is the deliverable the manager has to judge
+                    worker_reports=[results[key] for key in sorted(results)],
                 )
                 run["review"] = verdict.to_dict()
             except V1Error as exc:
@@ -754,6 +757,7 @@ def execute_run(
         layers = coordination.integration_layers(
             coordinator,
             applied=list(run.get("integration", {}).get("applied") or []),
+            changed=list(diff.get("changed") or []),
             receipts_exit_zero=any(int(row["exit_code"]) == 0 for row in receipts),
             node_states=run["node_states_final"],
         )

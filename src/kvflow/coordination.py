@@ -1173,7 +1173,7 @@ class SemanticCoordinator:
             # run with no contracts); FAIL always stays FAIL.
             if status == "PASS":
                 verdict = "PASS"
-            elif status == "NOT_RUN":
+            elif status in {"NOT_RUN", "NOT_APPLICABLE"}:
                 verdict = "NOT_APPLICABLE"
             else:
                 verdict = "FAIL"
@@ -1225,6 +1225,7 @@ def _change_action(state: str) -> str:
 
 def integration_layers(coordinator: "SemanticCoordinator", *, applied: Sequence[str],
                        receipts_exit_zero: bool,
+                       changed: Sequence[str] | None = None,
                        node_states: Mapping[str, str] | None = None) -> dict[str, Any]:
     """The three integration layers, each judged from evidence - not from a merge.
 
@@ -1232,7 +1233,15 @@ def integration_layers(coordinator: "SemanticCoordinator", *, applied: Sequence[
     agree on a schema, and nothing about whether the system behaves as the user
     asked, so those are separate verdicts with their own evidence.
     """
-    textual = "PASS" if applied else "FAIL"
+    # An approved empty changeset has nothing to integrate: a read-only task whose
+    # deliverable is a report must not be failed for not producing files, while a
+    # run that did change files and applied none is a real integration failure.
+    if applied:
+        textual = "PASS"
+    elif changed is not None and not list(changed):
+        textual = "NOT_APPLICABLE"
+    else:
+        textual = "FAIL"
     invariant_report = coordinator.invariant_status()
     validation = coordinator.validation_status()
     with coordinator.store.read() as conn:
